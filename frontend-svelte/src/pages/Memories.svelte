@@ -142,9 +142,10 @@
     let chatDeleteMsg = null;
     let chatDeleteBusy = false;
 
-    function openChatEdit(msg) {
+    async function openChatEdit(msg) {
         chatEditMsg = msg;
-        chatEditContent = msg.content || '';
+        const fullMsg = await api('GET', `/agents/${currentAgent}/chat-history/${msg.id}`);
+        chatEditContent = fullMsg.content || msg.content || '';
         chatEditOpen = true;
     }
     async function saveChatEdit() {

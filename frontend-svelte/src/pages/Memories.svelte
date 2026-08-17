@@ -138,21 +138,24 @@
     let chatEditMsg = null;
     let chatEditContent = '';
     let chatEditSaving = false;
+    let chatEditToken = 0;  // Token to detect if a newer click arrived while GET was in flight
     let chatDeleteOpen = false;
     let chatDeleteMsg = null;
     let chatDeleteBusy = false;
 
     async function openChatEdit(msg) {
+        const token = ++chatEditToken;  // Increment and capture token for this click
+        chatEditMsg = msg;  // Assign before await (so subsequent clicks see we're loading this msg)
         try {
             const fullMsg = await api('GET', `/agents/${currentAgent}/chat-history/${msg.id}`);
-            // Guard against race: if user clicked another Edit in the meantime, abort silently
-            if (chatEditMsg !== msg) return;
-            chatEditMsg = msg;
+            // Guard against race: if a newer click arrived while GET was in flight, abort silently
+            if (token !== chatEditToken) return;
             // Use ?? not || to avoid fallback to truncated display value if endpoint changes
             chatEditContent = fullMsg.content ?? '';
             chatEditOpen = true;
         } catch (e) {
-            toast(`Failed to load message: ${e.message}`, 'error');
+            // Only show error toast if this token is still current (don't spam if user clicked away)
+            if (token === chatEditToken) toast(`Failed to load message: ${e.message}`, 'error');
         }
     }
     async function saveChatEdit() {

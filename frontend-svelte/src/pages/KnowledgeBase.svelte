@@ -951,7 +951,8 @@
         {#if detailKind === 'raw'}
             <div class="detail-actions">
                 <button class="action-btn edit-btn" on:click={() => openEditModal(detailItem, detailContent)}
-                    title="Edit source">
+                    disabled={!detailContentLoaded}
+                    title={detailContentLoaded ? "Edit source" : "Waiting for content to load..."}>
                     <span class="material-symbols-outlined" style="font-size:15px">edit</span> Edit
                 </button>
                 <button class="action-btn delete-btn"

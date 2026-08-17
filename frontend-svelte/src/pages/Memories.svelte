@@ -143,10 +143,17 @@
     let chatDeleteBusy = false;
 
     async function openChatEdit(msg) {
-        chatEditMsg = msg;
-        const fullMsg = await api('GET', `/agents/${currentAgent}/chat-history/${msg.id}`);
-        chatEditContent = fullMsg.content || msg.content || '';
-        chatEditOpen = true;
+        try {
+            const fullMsg = await api('GET', `/agents/${currentAgent}/chat-history/${msg.id}`);
+            // Guard against race: if user clicked another Edit in the meantime, abort silently
+            if (chatEditMsg !== msg) return;
+            chatEditMsg = msg;
+            // Use ?? not || to avoid fallback to truncated display value if endpoint changes
+            chatEditContent = fullMsg.content ?? '';
+            chatEditOpen = true;
+        } catch (e) {
+            toast(`Failed to load message: ${e.message}`, 'error');
+        }
     }
     async function saveChatEdit() {
         if (!chatEditContent.trim() || !chatEditMsg) return;

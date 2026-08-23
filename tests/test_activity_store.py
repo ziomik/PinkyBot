@@ -32,7 +32,7 @@ class TestActivityStoreConcurrency:
                 connection_id = id(connection)
                 assert connection.execute(
                     "PRAGMA journal_mode"
-                ).fetchone()[0].lower() == "truncate"
+                ).fetchone()[0].lower() == "wal"
                 assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
                 agent_name = f"worker-{worker_index}"
                 for round_index in range(rounds):

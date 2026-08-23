@@ -107,7 +107,10 @@ class ActivityStore:
         event_type: str = "",
     ) -> list[dict]:
         """Return recent activity events, newest first."""
-        sql = "SELECT id, agent_name, event_type, title, description, metadata, created_at FROM activity_log WHERE 1=1"
+        sql = (
+            "SELECT id, agent_name, event_type, title, description, "
+            "metadata, created_at FROM activity_log WHERE 1=1"
+        )
         params: list = []
         if agent_name:
             sql += " AND agent_name=?"
@@ -146,10 +149,13 @@ class ActivityStore:
         """Return summary stats for the activity log."""
         total = self._db.execute("SELECT COUNT(*) FROM activity_log").fetchone()[0]
         by_type = self._db.execute(
-            "SELECT event_type, COUNT(*) FROM activity_log GROUP BY event_type ORDER BY COUNT(*) DESC"
+            "SELECT event_type, COUNT(*) FROM activity_log "
+            "GROUP BY event_type ORDER BY COUNT(*) DESC"
         ).fetchall()
         by_agent = self._db.execute(
-            "SELECT agent_name, COUNT(*) FROM activity_log WHERE agent_name != '' GROUP BY agent_name ORDER BY COUNT(*) DESC"
+            "SELECT agent_name, COUNT(*) FROM activity_log "
+            "WHERE agent_name != '' GROUP BY agent_name "
+            "ORDER BY COUNT(*) DESC"
         ).fetchall()
         restarts_by_agent = self.count_by_type_and_agent("context_restart")
         return {

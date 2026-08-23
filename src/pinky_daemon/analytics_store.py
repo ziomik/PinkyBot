@@ -6,6 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
 from pinky_daemon.store_catalog import StoreCatalog
 
 # Providers to include in analytics dashboards.

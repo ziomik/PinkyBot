@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from pinky_daemon.api import create_app
+from pinky_daemon.api import create_api
 from pinky_daemon.conversation_store import ConversationStore
 
 
@@ -20,7 +20,7 @@ from pinky_daemon.conversation_store import ConversationStore
 def app_client(tmp_path):
     """Create app with isolated conversation store."""
     db_path = str(tmp_path / "conversations.db")
-    app = create_app(conversation_db_path=db_path)
+    app = create_api(db_path=db_path)
     # Manually register a test agent so we have a valid agent name
     app.state.registry.register(
         name="test-agent",

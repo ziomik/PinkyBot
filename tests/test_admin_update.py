@@ -34,9 +34,12 @@ def _stub_resolve_and_verify():
 
 def _make_client():
     from pinky_daemon.api import create_api
-    fd, path = tempfile.mkstemp(suffix=".db")
+    # Use TemporaryDirectory() instead of /tmp to avoid world-writable permissions
+    # which the new WAL preflight checks reject for security
+    tmpdir = tempfile.TemporaryDirectory()
+    fd, path = tempfile.mkstemp(suffix=".db", dir=tmpdir.name)
     os.close(fd)
-    app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+    app = create_api(max_sessions=10, default_working_dir=tmpdir.name, db_path=path)
     return TestClient(app)
 
 

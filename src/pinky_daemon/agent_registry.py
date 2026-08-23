@@ -561,7 +561,7 @@ class Agent:
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
     provider_ref: str = ""   # ID of a global provider from the providers table
     codex_home: str = ""  # Explicit per-agent CODEX_HOME override (flag-gated)
-    thinking_effort: str = "medium"  # low, medium, high, xhigh, max, ultracode — default thinking depth
+    thinking_effort: str = "medium"  # Reasoning depth: low, medium, high, xhigh, max, ultracode
     # ``ultracode`` (#151): xhigh reasoning + standing workflow orchestration.
     # Resolves to xhigh for the actual effort knob (the CLI flag rejects the
     # literal "ultracode"); the workflow-by-default behavior is injected via

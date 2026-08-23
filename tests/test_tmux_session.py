@@ -12448,7 +12448,6 @@ def test_match_acceptance_turn_handles_nfd_nfc_mismatch() -> None:
     comparison. This verifies the fix for the redelivery loop bug.
     """
     import unicodedata
-    import time
 
     ss, _ = _make_session()
 

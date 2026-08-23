@@ -6308,7 +6308,6 @@ class TestScheduler:
         zombie = registry.add_schedule(
             "oleg", "0 3 * * *", name="zombie", prompt="never deliver"
         )
-        now = time.time()
         registry.persist_schedule_wake(
             stuck.id,
             agent_name="oleg",
@@ -6793,7 +6792,7 @@ class TestScheduler:
 
         # Oltre la finestra: da scartare
         stale_fired_at = time.time() - (25 * 3600)  # 25 ore fa
-        stale_wake_id = registry.persist_schedule_wake(
+        registry.persist_schedule_wake(
             schedule.id,
             agent_name="oleg",
             schedule_name="durable",
@@ -6803,7 +6802,7 @@ class TestScheduler:
 
         # Dentro la finestra: da consegnare
         fresh_fired_at = time.time() - 600  # 10 minuti fa
-        fresh_wake_id = registry.persist_schedule_wake(
+        registry.persist_schedule_wake(
             schedule.id,
             agent_name="oleg",
             schedule_name="durable",
@@ -8650,8 +8649,6 @@ class TestPendingWakeThrottleIntegration:
         scheduler = AgentScheduler(registry, wake_callback=wake_cb, trigger_store=store)
 
         # Simulate: agent status is "live" (proven-live-outbox condition triggered)
-        agent_name = "test_agent_3"
-
         # Create a pending wake in the DB (would be in scheduler's agent_schedule table)
         # For this test, we mock the replay behavior by calling replay_pending_for_agent directly
 
@@ -8692,7 +8689,6 @@ class TestPendingWakeThrottleIntegration:
         store = _StubTriggerStore()
         scheduler = AgentScheduler(registry, wake_callback=wake_cb, trigger_store=store)
 
-        agent_name = "test_agent_late_receipt"
         wake_id = 888
 
         # Simulate execution tracking
@@ -8750,7 +8746,6 @@ class TestPendingWakeThrottleSafetyC:
         scheduler = AgentScheduler(registry, wake_callback=wake_cb, trigger_store=store)
 
         wake_id = 777
-        agent_name = "test_agent_prolonged_outage"
 
         # t=0: Wake created, first replay attempt
         t_created = time.time()

@@ -10,7 +10,6 @@ Usage:
     curl -X POST http://localhost:8888/sessions/{id}/message -d '{"content": "Hello"}'
 """
 from __future__ import annotations
-from pydantic import BaseModel
 
 import asyncio
 import contextlib
@@ -51,6 +50,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
@@ -3991,9 +3991,9 @@ def create_api(
 
         # Build system prompt; if it exceeds Linux MAX_ARG_STRLEN (~128 KB)
         # pass it via a file to avoid CLIConnectionError [Errno 7] E2BIG.
-        _MAX_ARG_STRLEN = 128 * 1024  # conservative threshold (real limit 131072)
+        _max_arg_strlen = 128 * 1024  # conservative threshold (real limit 131072)
         _raw_system_prompt = agents.build_system_prompt(agent_name, skill_store=skills)
-        if len(_raw_system_prompt.encode("utf-8")) >= _MAX_ARG_STRLEN:
+        if len(_raw_system_prompt.encode("utf-8")) >= _max_arg_strlen:
             _sp_file = Path(work_dir) / ".pinky_system_prompt"
             _sp_file.write_text(_raw_system_prompt, encoding="utf-8")
             _effective_system_prompt: str | dict = {"path": str(_sp_file)}
@@ -12632,7 +12632,7 @@ npm run build</pre>
                     _days: int = _conv_retention_days,
                 ) -> None:
                     import asyncio as _asyncio
-                    _CHECK_INTERVAL = 6 * 3600  # every 6 hours
+                    _check_interval = 6 * 3600  # every 6 hours
                     while True:
                         try:
                             deleted = await _asyncio.to_thread(_store.prune, max_age_days=_days)
@@ -12640,7 +12640,7 @@ npm run build</pre>
                                 _log(f"conv_prune: deleted {deleted:,} messages older than {_days}d")
                         except Exception as _exc:
                             _log(f"conv_prune: error ({_exc})")
-                        await _asyncio.sleep(_CHECK_INTERVAL)
+                        await _asyncio.sleep(_check_interval)
 
                 app.state.conv_prune_task = asyncio.create_task(_conversation_prune_loop())
                 _log(f"startup: conversation pruning started (retention={_conv_retention_days}d)")
@@ -14523,22 +14523,22 @@ npm run build</pre>
     # Called from admin.aiena.it when Mirko clicks APPROVATO on a preview card.
     # Validates slug against pipeline.json investigations[status=preview] before
     # inserting into Supabase article_approvals. Prevents test/garbage entries.
-    import json as _json_mod
-    import urllib.request as _urllib_req
-    import urllib.error as _urllib_err
     import datetime as _dt_mod
+    import json as _json_mod
     import logging as _logging_mod
     import os as _os_mod
-    import tempfile as _tmp_mod
     import subprocess as _sp_mod
+    import tempfile as _tmp_mod
+    import urllib.error as _urllib_err
+    import urllib.request as _urllib_req
 
     _aiena_logger = _logging_mod.getLogger("aiena.approve")
-    _AIENA_PIPELINE = "/var/www/aiena.it/data/pipeline.json"
-    _AIENA_SB_URL   = "https://fwyjxolljcogblvwvfca.supabase.co"
-    _AIENA_SB_KEY   = _os_mod.environ.get("AIENA_SB_KEY", "")
-    _AIENA_SB_HDR   = {
-        "apikey": _AIENA_SB_KEY,
-        "Authorization": f"Bearer {_AIENA_SB_KEY}",
+    _aiena_pipeline = "/var/www/aiena.it/data/pipeline.json"
+    _aiena_sb_url   = "https://fwyjxolljcogblvwvfca.supabase.co"
+    _aiena_sb_key   = _os_mod.environ.get("AIENA_SB_KEY", "")
+    _aiena_sb_hdr   = {
+        "apikey": _aiena_sb_key,
+        "Authorization": f"Bearer {_aiena_sb_key}",
         "Content-Type": "application/json",
         "Prefer": "return=minimal",
     }
@@ -14546,7 +14546,7 @@ npm run build</pre>
     def _aiena_slug_in_pipeline(slug: str) -> bool:
         """Return True if slug exists in investigations[] with status='preview'."""
         try:
-            pipeline = _json_mod.loads(open(_AIENA_PIPELINE, encoding="utf-8").read())
+            pipeline = _json_mod.loads(open(_aiena_pipeline, encoding="utf-8").read())
             for inv in pipeline.get("investigations", []):
                 if inv.get("slug") == slug and inv.get("status") == "preview":
                     return True
@@ -14559,8 +14559,8 @@ npm run build</pre>
         Records with status='lead' are NOT considered approved — they can be re-approved."""
         try:
             req = _urllib_req.Request(
-                f"{_AIENA_SB_URL}/rest/v1/article_approvals?slug=eq.{slug}&status=in.(pending,published)&select=slug,status",
-                headers={k: v for k, v in _AIENA_SB_HDR.items() if k != "Prefer"},
+                f"{_aiena_sb_url}/rest/v1/article_approvals?slug=eq.{slug}&status=in.(pending,published)&select=slug,status",
+                headers={k: v for k, v in _aiena_sb_hdr.items() if k != "Prefer"},
             )
             with _urllib_req.urlopen(req, timeout=8) as r:
                 data = _json_mod.loads(r.read())
@@ -14580,9 +14580,9 @@ npm run build</pre>
         }
         data = _json_mod.dumps(payload).encode("utf-8")
         req = _urllib_req.Request(
-            f"{_AIENA_SB_URL}/rest/v1/article_approvals",
+            f"{_aiena_sb_url}/rest/v1/article_approvals",
             data=data,
-            headers=_AIENA_SB_HDR,
+            headers=_aiena_sb_hdr,
             method="POST",
         )
         try:
@@ -14600,7 +14600,7 @@ npm run build</pre>
     def _aiena_pipeline_set_approved(slug: str) -> bool:
         """Atomically update pipeline.json: set investigation[slug].status = 'approvato'."""
         try:
-            with open(_AIENA_PIPELINE, "r", encoding="utf-8") as f:
+            with open(_aiena_pipeline, "r", encoding="utf-8") as f:
                 pipeline = _json_mod.load(f)
             updated = False
             for inv in pipeline.get("investigations", []):
@@ -14612,12 +14612,12 @@ npm run build</pre>
             if not updated:
                 _aiena_logger.warning("pipeline_set_approved: slug=%s not found in preview", slug)
                 return False
-            dir_ = _os_mod.path.dirname(_AIENA_PIPELINE)
+            dir_ = _os_mod.path.dirname(_aiena_pipeline)
             fd, tmp = _tmp_mod.mkstemp(dir=dir_, suffix=".json.tmp")
             try:
                 with _os_mod.fdopen(fd, "w", encoding="utf-8") as f:
                     _json_mod.dump(pipeline, f, ensure_ascii=False, indent=4)
-                _os_mod.replace(tmp, _AIENA_PIPELINE)
+                _os_mod.replace(tmp, _aiena_pipeline)
             except Exception:
                 try:
                     _os_mod.unlink(tmp)
@@ -14739,7 +14739,7 @@ npm run build</pre>
         _aiena_logger.info("promote-lead called: slug=%s caller=%s", slug, caller_ip)
 
         try:
-            with open(_AIENA_PIPELINE, "r", encoding="utf-8") as f:
+            with open(_aiena_pipeline, "r", encoding="utf-8") as f:
                 pipeline = _json_mod.load(f)
         except Exception as exc:
             _aiena_logger.error("promote-lead: pipeline read error: %s", exc)
@@ -14748,7 +14748,7 @@ npm run build</pre>
         leads = pipeline.get("leads", [])
         investigations = pipeline.get("investigations", [])
 
-        lead = next((l for l in leads if l.get("slug") == slug), None)
+        lead = next((item for item in leads if item.get("slug") == slug), None)
         if not lead:
             return {"success": False, "promoted": False,
                     "message": f"Lead '{slug}' not found in pipeline.json leads[]"}
@@ -14773,16 +14773,16 @@ npm run build</pre>
         }
 
         investigations.append(investigation)
-        pipeline["leads"] = [l for l in leads if l.get("slug") != slug]
+        pipeline["leads"] = [item for item in leads if item.get("slug") != slug]
         pipeline["investigations"] = investigations
         pipeline["updated_at"] = _dt2.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
-            dir_ = _os_mod.path.dirname(_AIENA_PIPELINE)
+            dir_ = _os_mod.path.dirname(_aiena_pipeline)
             fd, tmp = _tmp_mod.mkstemp(dir=dir_, suffix=".json.tmp")
             with _os_mod.fdopen(fd, "w", encoding="utf-8") as f:
                 _json_mod.dump(pipeline, f, ensure_ascii=False, indent=4)
-            _os_mod.replace(tmp, _AIENA_PIPELINE)
+            _os_mod.replace(tmp, _aiena_pipeline)
         except Exception as exc:
             _aiena_logger.error("promote-lead: pipeline write error: %s", exc)
             raise HTTPException(status_code=500, detail="Cannot write pipeline.json")

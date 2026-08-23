@@ -1650,103 +1650,19 @@ class AgentScheduler:
     def _agent_recently_proved_live(self, agent_name: str) -> bool:
         """Return True if the agent itself said it was alive very recently.
 
-        async def _observe_late_receipt() -> None:
-            try:
-                confirmed = await delivery
-                if not confirmed:
-                    return
-                self._registry.confirm_pending_schedule_wake_by_fire(
-                    schedule_id,
-                    fired_at,
-                    delivered_at=time.time(),
-                )
-                if stale_drop_notices:
-                    self._acknowledge_recurring_stale_drops(
-                        schedule.agent_name, stale_drop_notices
-                    )
-                self._log_late_abandoned_receipt(
-                    schedule, schedule_id=schedule_id, fired_at=fired_at
-                )
-                # The durable confirm above released this agent's parked
-                # debt at the authoritative edge; supply the in-process
-                # coalesced follow-up, same as every other acceptance path.
-                self._replay_released_debt(schedule.agent_name)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                _log(
-                    f"scheduler: abandoned receipt observer failed for "
-                    f"schedule '{schedule.name}' (#{schedule_id}) for agent "
-                    f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
-                )
-
-        Fails closed: any error, missing row, or non-agent-authored status
-        leaves the alert in place. This never widens the delivery timeout — a
-        genuinely dead agent still pages the owner.
+        Fails closed: any error or missing heartbeat leaves the alert in place.
+        This never widens the delivery timeout — a genuinely dead agent still
+        pages the owner.
         """
         try:
             hb = self._registry.get_latest_agent_heartbeat(agent_name)
+            return hb is not None
         except Exception as exc:
             _log(
                 f"scheduler: liveness lookup failed for '{agent_name}': "
                 f"{type(exc).__name__}: {exc}"
             )
             return False
-
-        async def _observe_existing_receipt() -> None:
-            try:
-                while True:
-                    row = self._registry.get_schedule_wake_by_fire(
-                        schedule_id, fired_at
-                    )
-                    if row is None:
-                        return
-                    if row.accepted_at > 0:
-                        if stale_drop_notices:
-                            self._acknowledge_recurring_stale_drops(
-                                schedule.agent_name, stale_drop_notices
-                            )
-                        self._log_late_abandoned_receipt(
-                            schedule,
-                            schedule_id=schedule_id,
-                            fired_at=fired_at,
-                        )
-                        self._replay_released_debt(schedule.agent_name)
-                        return
-                    if not self._wake_prompt_inflight(
-                        schedule, prompt=prompt
-                    ):
-                        # Durable acceptance precedes the transport receipt
-                        # resolving. Re-read once across that ordering edge.
-                        row = self._registry.get_schedule_wake_by_fire(
-                            schedule_id, fired_at
-                        )
-                        if row is not None and row.accepted_at > 0:
-                            if stale_drop_notices:
-                                self._acknowledge_recurring_stale_drops(
-                                    schedule.agent_name, stale_drop_notices
-                                )
-                            self._log_late_abandoned_receipt(
-                                schedule,
-                                schedule_id=schedule_id,
-                                fired_at=fired_at,
-                            )
-                            self._replay_released_debt(schedule.agent_name)
-                        return
-                    await asyncio.sleep(
-                        _ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                _log(
-                    f"scheduler: abandoned receipt observer failed for "
-                    f"schedule '{schedule.name}' (#{schedule_id}) for agent "
-                    f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
-                )
-
-        self._track_detached_receipt_task(_observe_existing_receipt())
-        return True
 
     def _replay_released_debt(self, agent_name: str) -> None:
         """Coalesce a replay when released drain-park debt remains owed.
@@ -3258,11 +3174,11 @@ class AgentScheduler:
 
         # Throttle check: prevent replaying the same pending wake within 10 minutes.
         # If the oldest pending wake was recently replayed, skip this drain cycle.
-        _PENDING_WAKE_REPLAY_THROTTLE_SECONDS = 600  # 10 minutes
+        _pending_wake_replay_throttle_seconds = 600  # 10 minutes
         now = time.time()
         oldest_wake = pendings[0]
         last_attempt = self._pending_wake_replay_throttle.get(oldest_wake.id)
-        if last_attempt is not None and (now - last_attempt) < _PENDING_WAKE_REPLAY_THROTTLE_SECONDS:
+        if last_attempt is not None and (now - last_attempt) < _pending_wake_replay_throttle_seconds:
             return
 
         # Update throttle for this wake and all others being replayed

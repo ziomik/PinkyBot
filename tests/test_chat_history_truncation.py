@@ -13,7 +13,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pinky_daemon.api import create_api
-from pinky_daemon.conversation_store import ConversationStore
 
 
 @pytest.fixture

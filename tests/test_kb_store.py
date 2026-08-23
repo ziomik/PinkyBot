@@ -132,6 +132,37 @@ class TestUpdateRaw:
         assert updated.source_url == "https://example.com"
         assert updated.tags == ["keep"]
 
+    def test_update_without_content_preserves_body_issue_491(self, kb):
+        """Issue #491 fix: when content is not provided (None), body is preserved.
+
+        The backend fix for #491 is entirely in the frontend (don't send content
+        when it wasn't successfully loaded). The backend's contract is simple:
+        - content=None → don't touch the body
+        - content="X" → replace body with X
+
+        This test verifies the backend side: when frontend omits content (sends
+        None, which is absent in the request JSON), the body is left alone even
+        if other fields are updated.
+
+        The frontend fix: add detailContentLoaded flag, omit content key from
+        saveEdit() when false, so the backend receives None and preserves the body.
+        """
+        source = kb.ingest(title="Original", content="Keep this content", tags=["a"])
+
+        # Simulate: frontend updates title, tags, but omits content (None)
+        # This happens when detailContentLoaded is False.
+        updated = kb.update_raw(source.id, title="New Title", tags=["b"])
+        # Note: content is NOT passed, so it defaults to None
+
+        # Body should be preserved (not touched)
+        final = kb.get_raw_content(source.id)
+        assert "Keep this content" in final
+        assert "New Title" in final
+        assert updated.tags == ["b"]
+
+        # FTS still has the original content
+        assert len(kb.search("Keep this content")) == 1
+
 
 class TestCountRaw:
     def test_count_all(self, kb):

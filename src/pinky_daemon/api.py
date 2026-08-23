@@ -9,8 +9,8 @@ Usage:
     curl -X POST http://localhost:8888/sessions -d '{"model": "sonnet"}'
     curl -X POST http://localhost:8888/sessions/{id}/message -d '{"content": "Hello"}'
 """
-
 from __future__ import annotations
+from pydantic import BaseModel
 
 import asyncio
 import contextlib
@@ -232,6 +232,11 @@ from pinky_daemon.wake_prompt import WakeReason
 SHARED_MCP_ENABLED = os.environ.get("PINKY_SHARED_MCP", "0") == "1"
 
 _RESPONSE_SENT_HANDOFF_SCOPE_KEY = "pinky.response_sent_handoff"
+
+# Deploy guard-rail (#425): an untracked file at the repo root that pins a
+# machine to its current code. Untracked on purpose — a deploy must never be
+# able to remove its own brake.
+DEPLOY_LOCK_FILENAME = ".pinky-deploy-lock"
 
 try:
     from pinky_memory.store import ReflectionStore
@@ -1355,6 +1360,20 @@ def _write_mcp_json(
             db_path = getattr(agent_registry, "_db_path", "")
             if isinstance(db_path, str) and db_path:
                 stdio_env["PINKY_AGENTS_DB"] = db_path
+            # Memory embeddings: the pinky-memory stdio subprocess only reads
+            # OPENAI_API_KEY from its own environment (embeddings.py resolves
+            # api_key arg -> os.environ, and build_embedding_client() is called
+            # without an api_key in pinky_memory/__main__.py), so without this
+            # the key saved via set_setting() never reaches it and reflect()
+            # silently falls back to the NoOp embedder (embedded: false).
+            try:
+                openai_key = agent_registry.get_setting("OPENAI_API_KEY")
+                if isinstance(openai_key, str) and openai_key:
+                    stdio_env["OPENAI_API_KEY"] = openai_key
+            except Exception:
+                pass
+        if stdio_env:
+            mcp_config["mcpServers"]["pinky-memory"]["env"] = dict(stdio_env)
 
         # Pinky-self: heartbeat_ack, schedules, self-management
         tool_gates = _get_agent_tool_gates(agent_name, skill_store)
@@ -1702,6 +1721,23 @@ def _frontend_build_status(
         "message": "Frontend build manifest matches current source.",
     })
     return base
+
+
+# ── AIena Admin: module-level request models ─────────────────
+# Must be at module scope so FastAPI can resolve type hints via globalns
+# (PEP 563). If nested inside create_api(), FastAPI treats `req` as a
+# query parameter and returns 422 on every POST.
+
+class _AienaApproveRequest(BaseModel):
+    slug: str
+    title: str = ""
+    category: str = ""
+
+
+class _AienaPromoteRequest(BaseModel):
+    slug: str
+    title: str = ""
+    category: str = ""
 
 
 # ── API Server ───────────────────────────────────────────────
@@ -2350,6 +2386,28 @@ def create_api(
         reply_metadata: dict | None = None,
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
+        # OpenClaw bridge: agent replies for the openclaw "platform" are not sent
+        # via a platform adapter — they're routed back over the OpenClaw Gateway
+        # WebSocket (chat_id carries the OpenClaw sessionKey). See
+        # openclaw_gateway.deliver_agent_reply. Non-fatal if no client is
+        # connected (agent replied after the app disconnected).
+        if platform == "openclaw":
+            try:
+                from pinky_daemon import openclaw_gateway as _ocg
+
+                delivered = await _ocg.deliver_agent_reply(chat_id, content)
+            except Exception as e:  # noqa: BLE001 — bridge must not break agent turn
+                _log(f"openclaw: deliver_agent_reply failed: {e}")
+                delivered = False
+            broker._stop_typing(agent_name, chat_id)
+            return {
+                "sent": bool(delivered),
+                "agent": agent_name,
+                "platform": platform,
+                "chat_id": chat_id,
+                "message_id": "",
+            }
+
         if account_id and not agents.get_raw_token_for_account(
             agent_name, platform, account_id,
         ):
@@ -3319,6 +3377,18 @@ def create_api(
                 f"{agent_name}: {type(e).__name__}: {e}"
             )
 
+    async def _inject_wake_context_reload(agent_name: str, instruction: str) -> bool:
+        """Inject a context-reload instruction into a streaming session.
+
+        Called by streaming_session.connect() to recover from failed wake
+        submissions. Returns True if the injection succeeded, False otherwise.
+        """
+        streaming = broker._get_streaming_session(agent_name)
+        if not streaming:
+            return False
+        # send() returns bool indicating success
+        return await streaming.send(instruction)
+
     app.state._notify_scheduler_turn_idle = _notify_scheduler_turn_idle
 
     # Exposed for unit-test reach-in (verifying centralized wake logging
@@ -3919,16 +3989,39 @@ def create_api(
         except Exception as e:
             _log(f"streaming-start: ensure_workspace_hooks({agent_name}) — {e}")
 
-        async def _inject_wake_context_reload(
-            target_agent: str, instruction: str
-        ) -> bool:
-            """Route one wake-recovery instruction through the live broker."""
-            outcome = await broker.inject_agent_message(
-                "transport-recovery",
-                target_agent,
-                instruction,
+        # Build system prompt; if it exceeds Linux MAX_ARG_STRLEN (~128 KB)
+        # pass it via a file to avoid CLIConnectionError [Errno 7] E2BIG.
+        _MAX_ARG_STRLEN = 128 * 1024  # conservative threshold (real limit 131072)
+        _raw_system_prompt = agents.build_system_prompt(agent_name, skill_store=skills)
+        if len(_raw_system_prompt.encode("utf-8")) >= _MAX_ARG_STRLEN:
+            _sp_file = Path(work_dir) / ".pinky_system_prompt"
+            _sp_file.write_text(_raw_system_prompt, encoding="utf-8")
+            _effective_system_prompt: str | dict = {"path": str(_sp_file)}
+            _log(
+                f"streaming-start: system prompt {len(_raw_system_prompt.encode())} bytes "
+                f"exceeds MAX_ARG_STRLEN — using file: {_sp_file}"
             )
-            return outcome.delivered
+        else:
+            _effective_system_prompt = _raw_system_prompt
+
+        # First-ever tmux launch for this agent (i.e. an sdk→tmux transport
+        # migration, including the container flip in container_ops.py which
+        # also forces transport='tmux'). The agent's
+        # ``~/.claude/projects/<cwd>/`` is full of SDK-authored transcripts,
+        # so ``TmuxSession._has_prior_transcript()`` returns True and the
+        # launch would be ``claude --continue`` against an SDK transcript.
+        # The interactive REPL cannot resume those: it exits, tmux reaps the
+        # pane, and the agent goes connected→dead ~30s after boot. Force a
+        # fresh context for this one launch only; the marker is set after a
+        # successful connect, so every later tmux restart resumes its own
+        # tmux transcript normally. Pre-existing tmux agents are
+        # grandfathered by ``_backfill_tmux_bootstrapped``.
+        _first_tmux_boot = is_tmux and not agents.is_tmux_bootstrapped(agent_name)
+        if _first_tmux_boot:
+            _log(
+                f"streaming-start: {agent_name} first tmux launch "
+                f"(sdk→tmux migration) — forcing fresh context for this boot"
+            )
 
         config = StreamingSessionConfig(
             agent_name=agent_name,
@@ -3940,7 +4033,7 @@ def create_api(
             mcp_servers=codex_mcp_servers,
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
-            system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
+            system_prompt=_effective_system_prompt,
             resume_handle=resume_id,
             # commit=False here: the connect-time rebuild via
             # ``wake_context_builder`` is the delivered (committed) build
@@ -3977,6 +4070,7 @@ def create_api(
                 getattr(agent, "strict_effort_enforcement", False)
             ),
             idle_timeout=max(0, agent.auto_sleep_hours) * 3600,
+            force_fresh_context_once=_first_tmux_boot,
         )
 
         callback = await _make_streaming_response_callback()
@@ -4058,6 +4152,19 @@ def create_api(
                 )
             raise
         broker.register_streaming(agent_name, ss, label=label)
+
+        # The first tmux launch survived cold-start connect: record it so the
+        # next restart resumes this agent's own tmux transcript with
+        # ``--continue``. Deliberately AFTER connect+register — a failed boot
+        # leaves the marker unset so the retry is forced fresh again.
+        if _first_tmux_boot:
+            try:
+                agents.mark_tmux_bootstrapped(agent_name)
+            except Exception as e:
+                _log(
+                    f"streaming-start: mark_tmux_bootstrapped({agent_name}) "
+                    f"failed: {e}"
+                )
 
         # Log session lifecycle event
         event_type = "session_resume" if resume_id else "session_start"
@@ -4653,6 +4760,14 @@ def create_api(
         "/auth/setup",
         "/favicon.svg",
         "/icons.svg",
+        # OpenClaw device WebSocket — external Android client connects here;
+        # auth is handled inside the WS handshake, not via session cookie.
+        # Inert since #359: these two routes are only registered when
+        # OPENCLAW_ENABLED=1 (default 0), so with the bridge off nothing
+        # matches these entries. They stay listed so flipping the flag back on
+        # doesn't 401 the handshake.
+        "/openclaw/ws",
+        "/gateway/ws",
     }
     _public_prefixes = (
         "/assets/", "/static/", "/p/", "/hooks/",
@@ -4743,6 +4858,12 @@ def create_api(
         "/soul-templates", # soul template registry
         "/sprints",        # sprint management
         "/triggers",       # webhook/url trigger management
+        # OpenClaw/AIena/leads endpoints (commit 361e6dc) — agent/admin callers
+        # authenticate via internal auth headers or session cookie. The WS paths
+        # (/openclaw/ws, /gateway/ws) are carved out as public_exact above.
+        "/openclaw/",      # /openclaw/device (agent→device REST invoke)
+        "/api/aiena/",     # /api/aiena/approve-article (AIena admin action)
+        "/api/leads/",     # /api/leads/promote (lead promotion)
     )
 
     # Single source of truth for the auth gate's route classification. Exposed
@@ -4850,11 +4971,21 @@ def create_api(
         # The agent's own key (if provisioned) is checked first; the global
         # secret remains valid through the migration window.
         agent_key = None
+        key_lookup_failed = False
         if agent_name:
             try:
                 agent_key = agents.get_signing_key(agent_name)
-            except Exception:
+            except Exception as e:
+                # DIAG: this used to swallow the error silently, making a failed
+                # per-agent-key lookup indistinguishable from "agent has no key".
+                # A caller that SIGNED with its per-agent key then gets verified
+                # against the global secret only -> mismatch -> unexplained 401.
                 agent_key = None
+                key_lookup_failed = True
+                _log(
+                    f"auth-diag: signing-key lookup failed for '{agent_name}' "
+                    f"on {request.method} {request.url.path}: {type(e).__name__}: {e}"
+                )
         # #149 phase-3 inc2: the global secret is a universal bearer credential
         # (accepted for every name), so it may authenticate ONLY a proven
         # existing non-isolated agent. Isolated callers must use their own
@@ -4864,9 +4995,29 @@ def create_api(
         # fleet-wide (#623) so legitimate callers are unaffected.
         allow_global_secret = _global_secret_allowed_for(agent_name)
         usable_secret = secret if allow_global_secret else ""
+
+        def _diag_deny(reason: str) -> None:
+            # DIAG: only for requests that actually CLAIM an agent identity, so
+            # internet scanners (no headers) don't flood the journal.
+            if not agent_name:
+                return
+            try:
+                ts_delta: Any = int(time.time()) - int(timestamp)
+            except Exception:
+                ts_delta = "unparsable"
+            _log(
+                f"auth-diag: deny {request.method} {request.url.path} "
+                f"agent='{agent_name}' reason={reason} "
+                f"agent_key={'yes' if agent_key else 'no'} "
+                f"key_lookup_failed={key_lookup_failed} "
+                f"allow_global={allow_global_secret} "
+                f"global_secret_set={bool(secret)} ts_delta={ts_delta}"
+            )
+
         if not usable_secret and not agent_key:
+            _diag_deny("no-usable-credential")
             return False
-        return verify_internal_request(
+        verified = verify_internal_request(
             secret,
             agent_name=agent_name,
             method=request.method,
@@ -4876,6 +5027,9 @@ def create_api(
             agent_key=agent_key,
             allow_global_secret=allow_global_secret,
         )
+        if not verified:
+            _diag_deny("verify-failed")
+        return verified
 
     def _internal_isolation_denied(request: Request, caller_name: str) -> bool:
         """#149 tenant isolation (PATH-target surfaces): an authenticated
@@ -5126,12 +5280,17 @@ def create_api(
                     status_code=403,
                     content=content,
                 )
+            # #463: record WHO authenticated. Routes that are owner-only (memory
+            # edit/delete) read this to tell a signed agent from a UI session.
+            request.state.auth_actor = "agent"
+            request.state.auth_agent = caller
             return await call_next(request)
 
         # 3. Valid session cookie → through. Pulled up from the per-path
         #    branches below so a logged-in browser session passes the same
         #    way regardless of which protected surface is being hit.
         if _has_valid_session(request):
+            request.state.auth_actor = "owner"
             return await call_next(request)
 
         # 4. Protected HTML pages: unauth → 307 redirect to /login (or
@@ -11391,6 +11550,26 @@ npm run build</pre>
         states = dream_runner.list_states()
         return {"dream_states": states, "count": len(states)}
 
+    @app.patch("/agents/{agent_name}/dream")
+    async def update_dream_summary(agent_name: str, req: Request):
+        """Edit the dream summary for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        body = await req.json()
+        summary = body.get("summary", "")
+        if not dream_runner.update_summary(agent_name, summary):
+            raise HTTPException(404, "No dream state found for this agent")
+        return {"ok": True}
+
+    @app.delete("/agents/{agent_name}/dream")
+    async def delete_dream_state(agent_name: str):
+        """Delete dream state for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        if not dream_runner.delete_state(agent_name):
+            raise HTTPException(404, "No dream state found for this agent")
+        return {"ok": True}
+
     # ── Agent Context (continuation state) ──────────────────
 
     @app.put("/agents/{agent_name}/context")
@@ -12442,25 +12621,31 @@ npm run build</pre>
             except Exception as exc:  # never let log rotation abort startup
                 _log(f"startup: log rotation not started ({exc})")
 
-        # Buzz is a required-dependency outbound platform. A broken/partially
-        # healed venv must refuse every enabled identity and page the owner;
-        # silently leaving send() registered but non-functional is unsafe.
-        from pinky_daemon.buzz_runtime import register_buzz_outbound_platforms
+        # Conversation pruning — delete messages older than PINKY_CONV_RETENTION_DAYS
+        # (default 30). Runs every 6 hours in a background thread to avoid blocking
+        # the event loop during bulk deletes on a large messages table.
+        _conv_retention_days = int(os.environ.get("PINKY_CONV_RETENTION_DAYS", "30"))
+        if _conv_retention_days > 0:
+            try:
+                async def _conversation_prune_loop(
+                    _store: "ConversationStore" = store,
+                    _days: int = _conv_retention_days,
+                ) -> None:
+                    import asyncio as _asyncio
+                    _CHECK_INTERVAL = 6 * 3600  # every 6 hours
+                    while True:
+                        try:
+                            deleted = await _asyncio.to_thread(_store.prune, max_age_days=_days)
+                            if deleted:
+                                _log(f"conv_prune: deleted {deleted:,} messages older than {_days}d")
+                        except Exception as _exc:
+                            _log(f"conv_prune: error ({_exc})")
+                        await _asyncio.sleep(_CHECK_INTERVAL)
 
-        app.state.buzz_registration = await register_buzz_outbound_platforms(
-            agents, _notify_owner_alert
-        )
-        if app.state.buzz_registration["refused"]:
-            _log(
-                "startup: Buzz platform registration REFUSED for "
-                f"{app.state.buzz_registration['refused']} identity(s)"
-            )
-        released_buzz_claims = agents.reset_buzz_inbound_event_claims_after_restart()
-        if released_buzz_claims:
-            _log(
-                f"startup: released {released_buzz_claims} interrupted Buzz "
-                "inbound delivery claim(s)"
-            )
+                app.state.conv_prune_task = asyncio.create_task(_conversation_prune_loop())
+                _log(f"startup: conversation pruning started (retention={_conv_retention_days}d)")
+            except Exception as exc:  # never let pruning abort startup
+                _log(f"startup: conversation pruning not started ({exc})")
 
         # Start shared MCP server BEFORE agent sessions so SSE URLs are ready
         if SHARED_MCP_ENABLED:
@@ -12994,6 +13179,7 @@ npm run build</pre>
         dry_run: bool = False,
         force: bool = False,
         force_deps: bool = False,
+        override_guard: bool = False,
     ):
         """Update to a verified release (or a pinned ref) and restart.
 
@@ -13021,6 +13207,16 @@ npm run build</pre>
         commit-SHA target is always an operator pin (existence-checked only).
 
         force_deps=True: reinstall dependencies even when HEAD didn't change.
+
+        Guard-rail (#425) — two independent layers refuse the deploy:
+        (1) a ``.pinky-deploy-lock`` file at the repo root (explicit intent),
+        (2) a divergent HEAD, i.e. commits reachable from HEAD but not from
+            the deploy ref, which a checkout would silently discard.
+        ``force`` does not lift either — it only skips release verification.
+        ``override_guard=True`` disarms both; it is intentionally NOT exposed
+        through the pinky-self MCP tool, so disarming requires a deliberate
+        human API call. ``dry_run`` still works while blocked and reports
+        which layer would stop the deploy.
         """
         import shutil
         import subprocess as sp
@@ -13049,6 +13245,33 @@ npm run build</pre>
         # take minutes; run it off the event loop so the daemon keeps
         # routing messages while the update proceeds.
         def _run_update() -> dict:
+            # Guard layer 1 (#425): an explicit, untracked lock file. Checked
+            # before any git command so a locked machine is never fetched into
+            # or reset. `force` does NOT lift it — force means "skip release
+            # verification", not "permission to deploy". Only override_guard
+            # (API-only, deliberately absent from the pinky-self MCP tool)
+            # disarms it, so no agent can unblock itself.
+            lock_block: dict | None = None
+            lock_path = Path(repo_dir) / DEPLOY_LOCK_FILENAME
+            if not override_guard and lock_path.exists():
+                try:
+                    reason = lock_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).strip()[:500]
+                except OSError as e:
+                    reason = f"<unreadable lock file: {e}>"
+                lock_block = {
+                    "error": (
+                        f"deploy refused: {DEPLOY_LOCK_FILENAME} is present. "
+                        "Remove the file (or pass override_guard=true) to deploy."
+                    ),
+                    "blocked_by": "deploy_lock",
+                    "lock_reason": reason,
+                }
+                _log(f"admin: update refused — {DEPLOY_LOCK_FILENAME} present ({reason!r})")
+                if not dry_run:
+                    return lock_block
+
             # Current state
             try:
                 before_hash = sp.check_output(
@@ -13100,6 +13323,56 @@ npm run build</pre>
             )
             target_tag = self_update.latest_release_tag(repo_dir)
 
+            # Guard layer 2 (#425): divergence. Independent of the lock file —
+            # it survives someone deleting it, because it checks a fact rather
+            # than an intention. On an aligned machine `rev-list <ref>..HEAD` is
+            # empty and this is a no-op, so legitimate deploys are unaffected.
+            local_only: list[str] = []
+            check_error: str | None = None
+            if decision.ref and not override_guard:
+                try:
+                    revs = sp.check_output(
+                        ["git", "rev-list", f"{decision.ref}..HEAD"],
+                        cwd=repo_dir, stderr=sp.DEVNULL, timeout=15,
+                    ).decode().strip()
+                    local_only = [r for r in revs.splitlines() if r.strip()]
+                except Exception as e:
+                    # Fail CLOSED. #422→#425 all came from silent failures; a
+                    # safety layer that proceeds when it cannot verify repeats
+                    # that pattern exactly when something is already anomalous
+                    # (broken git), i.e. when the risk is highest.
+                    check_error = str(e)[:300]
+                    _log(f"admin: divergence check failed ({e}) — refusing deploy")
+            divergence_block: dict | None = None
+            if check_error is not None:
+                divergence_block = {
+                    "error": (
+                        "deploy refused: the divergence check could not be run "
+                        f"({check_error}), so it is unknown whether HEAD carries "
+                        f"commits absent from {decision.ref}. Repair the repository, "
+                        "or pass override_guard=true to deploy without the check."
+                    ),
+                    "blocked_by": "divergence_check_failed",
+                    "check_error": check_error,
+                }
+            elif local_only:
+                divergence_block = {
+                    "error": (
+                        f"deploy refused: HEAD carries {len(local_only)} commit(s) "
+                        f"not present in {decision.ref}; checking it out would "
+                        f"discard them. Inspect with "
+                        f"`git log --oneline {decision.ref}..HEAD`, then either "
+                        "land them upstream or pass override_guard=true."
+                    ),
+                    "blocked_by": "divergent_head",
+                    "local_only_count": len(local_only),
+                    "local_only_commits": [r[:8] for r in local_only[:10]],
+                }
+                _log(
+                    f"admin: update refused — HEAD diverges from {decision.ref} "
+                    f"by {len(local_only)} commit(s)"
+                )
+
             # Preview mode — report the planned deploy without mutating anything.
             if dry_run:
                 try:
@@ -13126,12 +13399,27 @@ npm run build</pre>
                     result["latest_release"] = target_tag
                 if decision.error:
                     result["verify_error"] = decision.error
+                # Preview is read-only, so it runs even while blocked — and says
+                # which layer would stop the real deploy.
+                if lock_block:
+                    result.update(lock_block)
+                elif divergence_block:
+                    result.update(divergence_block)
                 return result
 
             # Refuse before touching the working tree if verification failed.
             if decision.error:
                 return {
                     "error": decision.error,
+                    "current_release": current_tag,
+                    "staying_on_version": before_hash,
+                }
+
+            # Guard layer 2 refusal — must land before the force block, so a
+            # forced deploy cannot discard tracked files on the way out.
+            if divergence_block:
+                return {
+                    **divergence_block,
                     "current_release": current_tag,
                     "staying_on_version": before_hash,
                 }
@@ -13363,9 +13651,15 @@ npm run build</pre>
         return result
 
     @app.post("/admin/restart")
-    async def admin_restart():
+    async def admin_restart(request: Request):
         """Graceful daemon restart. Requires process manager for auto-restart."""
         import signal
+
+        # Log caller details for auditing
+        caller_ip = request.client.host if request.client else "unknown"
+        caller_ua = request.headers.get("user-agent", "unknown")
+        caller_ref = request.headers.get("referer", "")
+        _log(f"admin: /admin/restart called — ip={caller_ip} ua={caller_ua!r} referer={caller_ref!r}")
 
         async def _delayed_exit():
             await asyncio.sleep(1)
@@ -13804,7 +14098,8 @@ npm run build</pre>
             "lifetime_agents": lifetime_costs,
         }
 
-    # ── Autonomy Engine ────────────────────────────────────
+
+        # ── Autonomy Engine ────────────────────────────────────
 
     @app.get("/autonomy/status")
     async def autonomy_status():
@@ -14157,6 +14452,352 @@ npm run build</pre>
         _log("voice: WS endpoint registered at /ws/voice/{id}")
     except ImportError:
         pass
+
+    # OpenClaw Gateway Protocol v4 bridge — lets the OpenClaw Android app
+    # connect and chat with the target agent (default: satoshi) without a
+    # separate OpenClaw Gateway server. Additive: no existing route is touched.
+    #
+    # Default OFF since #359. The only client that ever used this bridge was the
+    # OpenClaw Android app, uninstalled on 06/08/2026; while connected it looped
+    # on unimplemented methods (~5.7k chat.metadata/day, all METHOD_NOT_FOUND).
+    # These two WebSockets are also carved out of the route auth gate as public,
+    # so leaving them registered means two unauthenticated sockets exposed for a
+    # client that no longer exists. Re-enable with OPENCLAW_ENABLED=1 (one
+    # daemon restart) if the bridge is ever needed again; the code below is
+    # unchanged, only its registration is gated.
+    _openclaw_enabled = os.environ.get(
+        "OPENCLAW_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    if not _openclaw_enabled:
+        _log("openclaw: gateway disabled (OPENCLAW_ENABLED=0) — routes not registered")
+    else:
+        try:
+            from pinky_daemon import openclaw_gateway as _ocg
+
+            _ocg.set_dependencies(
+                broker=broker,
+                ensure_session=_ensure_streaming_session,
+                agents=agents,
+                transport_session_state=TransportSessionState,
+                target_agent=os.environ.get("OPENCLAW_TARGET_AGENT", "satoshi"),
+            )
+
+            @app.websocket("/openclaw/ws")
+            async def openclaw_ws(ws: WebSocket):
+                await _ocg.handle_connection(ws)
+
+            # Common alternate paths OpenClaw clients probe for the gateway socket.
+            @app.websocket("/gateway/ws")
+            async def openclaw_gateway_ws(ws: WebSocket):
+                await _ocg.handle_connection(ws)
+
+            # ── OpenClaw device invoke REST endpoint ─────────────────────────
+            # Allows the AI agent (Satoshi) to call device methods on the
+            # connected Android node via HTTP, without needing a WebSocket
+            # connection.
+            # Usage: POST /openclaw/device {"method": "camera.snap", "params": {}}
+            @app.post("/openclaw/device")
+            async def openclaw_device_invoke(request: Request):
+                from fastapi.responses import JSONResponse as _JSONResponse
+                body = await request.json()
+                method = str(body.get("method") or "")
+                params = dict(body.get("params") or {})
+                timeout = float(body.get("timeout") or 15.0)
+                if not method:
+                    return _JSONResponse({"ok": False, "error": "method required"}, status_code=400)
+                try:
+                    result = await _ocg._forward_to_node(method, params, timeout=timeout)
+                    return _JSONResponse({"ok": True, "payload": result})
+                except ValueError as exc:
+                    return _JSONResponse({"ok": False, "error": str(exc), "code": "NODE_UNAVAILABLE"}, status_code=503)
+                except TimeoutError:
+                    return _JSONResponse({"ok": False, "error": f"{method} timed out", "code": "TIMEOUT"}, status_code=504)
+                except Exception as exc:  # noqa: BLE001
+                    return _JSONResponse({"ok": False, "error": str(exc), "code": "DEVICE_ERROR"}, status_code=500)
+
+            _log("openclaw: gateway WS registered at /openclaw/ws and /gateway/ws")
+        except Exception as _ocg_exc:  # noqa: BLE001 — bridge is optional
+            _log(f"openclaw: gateway not registered ({_ocg_exc})")
+
+    # ── AIena: approve article ─────────────────────────────────────────────────
+    # Called from admin.aiena.it when Mirko clicks APPROVATO on a preview card.
+    # Validates slug against pipeline.json investigations[status=preview] before
+    # inserting into Supabase article_approvals. Prevents test/garbage entries.
+    import json as _json_mod
+    import urllib.request as _urllib_req
+    import urllib.error as _urllib_err
+    import datetime as _dt_mod
+    import logging as _logging_mod
+    import os as _os_mod
+    import tempfile as _tmp_mod
+    import subprocess as _sp_mod
+
+    _aiena_logger = _logging_mod.getLogger("aiena.approve")
+    _AIENA_PIPELINE = "/var/www/aiena.it/data/pipeline.json"
+    _AIENA_SB_URL   = "https://fwyjxolljcogblvwvfca.supabase.co"
+    _AIENA_SB_KEY   = _os_mod.environ.get("AIENA_SB_KEY", "")
+    _AIENA_SB_HDR   = {
+        "apikey": _AIENA_SB_KEY,
+        "Authorization": f"Bearer {_AIENA_SB_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+    def _aiena_slug_in_pipeline(slug: str) -> bool:
+        """Return True if slug exists in investigations[] with status='preview'."""
+        try:
+            pipeline = _json_mod.loads(open(_AIENA_PIPELINE, encoding="utf-8").read())
+            for inv in pipeline.get("investigations", []):
+                if inv.get("slug") == slug and inv.get("status") == "preview":
+                    return True
+        except Exception as exc:
+            _aiena_logger.warning("pipeline.json read error: %s", exc)
+        return False
+
+    def _aiena_sb_exists(slug: str) -> bool:
+        """Return True if slug already in Supabase article_approvals WITH status='pending' or 'published'.
+        Records with status='lead' are NOT considered approved — they can be re-approved."""
+        try:
+            req = _urllib_req.Request(
+                f"{_AIENA_SB_URL}/rest/v1/article_approvals?slug=eq.{slug}&status=in.(pending,published)&select=slug,status",
+                headers={k: v for k, v in _AIENA_SB_HDR.items() if k != "Prefer"},
+            )
+            with _urllib_req.urlopen(req, timeout=8) as r:
+                data = _json_mod.loads(r.read())
+                return len(data) > 0
+        except Exception as exc:
+            _aiena_logger.warning("Supabase exists check failed: %s", exc)
+            return False
+
+    def _aiena_sb_insert(slug: str, title: str, category: str) -> bool:
+        """INSERT into article_approvals using service role key."""
+        payload = {
+            "slug": slug,
+            "title": title,
+            "category": category,
+            "approved_at": _dt_mod.datetime.now(_dt_mod.timezone.utc).isoformat(),
+            "status": "pending",
+        }
+        data = _json_mod.dumps(payload).encode("utf-8")
+        req = _urllib_req.Request(
+            f"{_AIENA_SB_URL}/rest/v1/article_approvals",
+            data=data,
+            headers=_AIENA_SB_HDR,
+            method="POST",
+        )
+        try:
+            with _urllib_req.urlopen(req, timeout=10) as r:
+                _aiena_logger.info("Supabase INSERT OK slug=%s status=%s", slug, r.status)
+                return True
+        except _urllib_err.HTTPError as exc:
+            body = exc.read().decode()
+            _aiena_logger.error("Supabase INSERT HTTP %s slug=%s body=%s", exc.code, slug, body[:300])
+            return False
+        except Exception as exc:
+            _aiena_logger.error("Supabase INSERT error slug=%s exc=%s", slug, exc)
+            return False
+
+    def _aiena_pipeline_set_approved(slug: str) -> bool:
+        """Atomically update pipeline.json: set investigation[slug].status = 'approvato'."""
+        try:
+            with open(_AIENA_PIPELINE, "r", encoding="utf-8") as f:
+                pipeline = _json_mod.load(f)
+            updated = False
+            for inv in pipeline.get("investigations", []):
+                if inv.get("slug") == slug and inv.get("status") == "preview":
+                    inv["status"] = "approvato"
+                    pipeline["updated_at"] = _dt_mod.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    updated = True
+                    break
+            if not updated:
+                _aiena_logger.warning("pipeline_set_approved: slug=%s not found in preview", slug)
+                return False
+            dir_ = _os_mod.path.dirname(_AIENA_PIPELINE)
+            fd, tmp = _tmp_mod.mkstemp(dir=dir_, suffix=".json.tmp")
+            try:
+                with _os_mod.fdopen(fd, "w", encoding="utf-8") as f:
+                    _json_mod.dump(pipeline, f, ensure_ascii=False, indent=4)
+                _os_mod.replace(tmp, _AIENA_PIPELINE)
+            except Exception:
+                try:
+                    _os_mod.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            _aiena_logger.info("pipeline_set_approved: slug=%s → approvato", slug)
+            return True
+        except Exception as exc:
+            _aiena_logger.error("pipeline_set_approved ERROR slug=%s exc=%s", slug, exc)
+            return False
+
+    @app.get("/api/aiena/admin-data")
+    async def aiena_admin_data(request: Request):
+        """Serve i dati editoriali del pannello AIena, dietro autenticazione (#397).
+
+        Prima questi dati stavano su https://admin.aiena.it/data.json: 198KB di
+        materiale editoriale interno, raggiungibili da chiunque senza credenziali.
+        Il 04/08/2026 alle 16:38 il crawler di Telegram li ha effettivamente
+        scaricati (200, 51.710 byte nei log di accesso): non era un rischio
+        teorico. Stando sotto /api/aiena/, questo percorso passa dal gate di
+        autenticazione del daemon (_protected_api_prefixes).
+
+        Il file continua a essere scritto su filesystem dagli script che lo
+        generano: questo endpoint lo espone soltanto in lettura.
+
+        NON usato dal pannello. Il 05/08/2026 #397 e' stato chiuso in modo
+        diverso: HTTP Basic auth di nginx su tutto admin.aiena.it, che protegge
+        in un colpo la pagina, /data.json e /review-reports/. La migrazione del
+        pannello a questo endpoint non poteva funzionare, perche' su
+        admin.aiena.it non esiste una rotta di login (404) e il cookie di
+        sessione del daemon e' host-only + SameSite=strict: nessun browser puo'
+        ottenere una credenziale valida per quell'host. Resta qui come lettura
+        autenticata alternativa per chiamanti che una sessione ce l'hanno gia'
+        (SPA del daemon, agenti con firma HMAC interna).
+        """
+        data_path = Path("/var/www/aiena.it/admin/data.json")
+        caller_ip = request.client.host if request.client else "unknown"
+        if not data_path.is_file():
+            _aiena_logger.warning(
+                "admin-data: file assente (%s), caller=%s", data_path, caller_ip
+            )
+            raise HTTPException(status_code=404, detail="data.json non disponibile")
+        try:
+            payload = data_path.read_bytes()
+        except OSError as exc:
+            _aiena_logger.error("admin-data: lettura fallita: %s", exc)
+            raise HTTPException(status_code=500, detail="lettura non riuscita") from exc
+        _aiena_logger.info(
+            "admin-data servito: %d byte, caller=%s", len(payload), caller_ip
+        )
+        # Dati vivi e riservati: non devono restare in nessuna cache, ne' del
+        # browser ne' della CDN. Il 05/08 una cache di 4 ore su un altro file ha
+        # tenuto invisibile un deploy per mezza giornata.
+        return Response(
+            content=payload,
+            media_type="application/json",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Cloudflare-CDN-Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/api/aiena/approve-article")
+    async def aiena_approve_article(req: _AienaApproveRequest, request: Request):
+        """Approve an AIena article: validates slug, then inserts into Supabase.
+
+        Returns 422 if slug is not a known investigation with status='preview'.
+        Idempotent: returns 200 if already in Supabase.
+        """
+        caller_ip = request.client.host if request.client else "unknown"
+        slug = req.slug.strip()
+        _aiena_logger.info(
+            "approve-article called: slug=%s title=%r caller=%s",
+            slug, req.title[:60], caller_ip
+        )
+
+        if not _aiena_slug_in_pipeline(slug):
+            _aiena_logger.warning(
+                "approve-article REJECTED: slug=%s not in pipeline investigations[preview] caller=%s",
+                slug, caller_ip
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=f"Slug '{slug}' not found in AIena pipeline investigations with status='preview'. "
+                       "Only valid preview articles can be approved."
+            )
+
+        if _aiena_sb_exists(slug):
+            _aiena_logger.info("approve-article: slug=%s already in Supabase — skip INSERT", slug)
+            return {"ok": True, "slug": slug, "inserted": False, "message": "Already approved"}
+
+        ok = _aiena_sb_insert(slug, req.title, req.category)
+        if not ok:
+            raise HTTPException(status_code=500, detail="Supabase INSERT failed")
+
+        # Sync pipeline.json: preview → approvato (best-effort)
+        _aiena_pipeline_set_approved(slug)
+
+        # Trigger immediate admin data refresh
+        _sp_mod.Popen(
+            ["/home/pinky/.pinkybot/.venv/bin/python3",
+             "/home/pinky/.pinkybot/scripts/update_admin_data.py"],
+            stdout=_sp_mod.DEVNULL, stderr=_sp_mod.DEVNULL
+        )
+
+        _aiena_logger.info("approve-article SUCCESS: slug=%s caller=%s", slug, caller_ip)
+        return {"ok": True, "slug": slug, "inserted": True}
+
+    _log("aiena: /api/aiena/approve-article registered")
+
+    # ── AIena: promote lead → investigation ────────────────────────────────────
+    @app.post("/api/leads/promote")
+    async def aiena_promote_lead(req: _AienaPromoteRequest, request: Request):
+        """Promote a lead to active investigation in pipeline.json."""
+        import datetime as _dt2
+        caller_ip = request.client.host if request.client else "unknown"
+        slug = req.slug.strip()
+        _aiena_logger.info("promote-lead called: slug=%s caller=%s", slug, caller_ip)
+
+        try:
+            with open(_AIENA_PIPELINE, "r", encoding="utf-8") as f:
+                pipeline = _json_mod.load(f)
+        except Exception as exc:
+            _aiena_logger.error("promote-lead: pipeline read error: %s", exc)
+            raise HTTPException(status_code=500, detail="Cannot read pipeline.json")
+
+        leads = pipeline.get("leads", [])
+        investigations = pipeline.get("investigations", [])
+
+        lead = next((l for l in leads if l.get("slug") == slug), None)
+        if not lead:
+            return {"success": False, "promoted": False,
+                    "message": f"Lead '{slug}' not found in pipeline.json leads[]"}
+
+        if any(inv.get("slug") == slug for inv in investigations):
+            return {"success": True, "promoted": True,
+                    "message": "Already an active investigation"}
+
+        now_str = _dt2.datetime.now().strftime("%Y-%m-%d")
+        investigation = {
+            "title": req.title or lead.get("title", slug),
+            "slug": slug,
+            "status": "ricerca",
+            "category": req.category or lead.get("category", "Indagine"),
+            "description": lead.get("description", lead.get("summary", "")),
+            "priority_score": lead.get("priority_score", lead.get("score", 0)),
+            "sources": lead.get("sources", []),
+            "research_notes": lead.get("research_notes", lead.get("notes", [])),
+            "added": lead.get("added", now_str),
+            "promoted_at": _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
+            "signal_source": lead.get("signal_source", "admin_panel"),
+        }
+
+        investigations.append(investigation)
+        pipeline["leads"] = [l for l in leads if l.get("slug") != slug]
+        pipeline["investigations"] = investigations
+        pipeline["updated_at"] = _dt2.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            dir_ = _os_mod.path.dirname(_AIENA_PIPELINE)
+            fd, tmp = _tmp_mod.mkstemp(dir=dir_, suffix=".json.tmp")
+            with _os_mod.fdopen(fd, "w", encoding="utf-8") as f:
+                _json_mod.dump(pipeline, f, ensure_ascii=False, indent=4)
+            _os_mod.replace(tmp, _AIENA_PIPELINE)
+        except Exception as exc:
+            _aiena_logger.error("promote-lead: pipeline write error: %s", exc)
+            raise HTTPException(status_code=500, detail="Cannot write pipeline.json")
+
+        _sp_mod.Popen(
+            ["/home/pinky/.pinkybot/.venv/bin/python3",
+             "/home/pinky/.pinkybot/scripts/update_admin_data.py"],
+            stdout=_sp_mod.DEVNULL, stderr=_sp_mod.DEVNULL
+        )
+
+        _aiena_logger.info("promote-lead SUCCESS: slug=%s", slug)
+        return {"success": True, "promoted": True, "slug": slug,
+                "message": f"Lead '{slug}' promosso a indagine attiva (ricerca)"}
+
+    _log("aiena: /api/leads/promote registered")
 
     # Installed last so this pure-ASGI layer wraps every BaseHTTPMiddleware
     # registered above.  Its final-body ``send`` return is the deterministic

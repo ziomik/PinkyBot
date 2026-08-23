@@ -2001,6 +2001,7 @@ class AgentRegistry:
         self._backfill_runtime_from_provider_url()
         self._warn_codex_runtime_mismatches()
         self._backfill_signing_keys()
+        self._backfill_tmux_bootstrapped()
 
         # Migrate agent_schedules table
         sched_existing = {
@@ -2126,6 +2127,18 @@ class AgentRegistry:
                 "ALTER TABLE agent_contexts ADD COLUMN wake_action TEXT NOT NULL DEFAULT ''"
             )
             _log("agent_registry: migrated — added wake_action to agent_contexts")
+
+        # Migrate pending_schedule_wakes table — add attempt_count to prevent
+        # infinite retry loops when wake confirmation fails. Wakes stuck in
+        # confirmation failure will be discarded after MAX_ATTEMPTS (3).
+        psw_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(pending_schedule_wakes)").fetchall()
+        }
+        if "attempt_count" not in psw_existing:
+            self._db.execute(
+                "ALTER TABLE pending_schedule_wakes ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+            _log("agent_registry: migrated — added attempt_count to pending_schedule_wakes")
 
         # Migrate pending_messages table — reply_chat_id preserves the true reply
         # destination (e.g. the Slack/Telegram channel a group message arrived in).
@@ -2335,6 +2348,40 @@ class AgentRegistry:
         self._db.commit()
         if cursor.rowcount:
             _log(f"agent_registry: backfilled runtime=codex_cli for {cursor.rowcount} agent(s)")
+
+    def _backfill_tmux_bootstrapped(self) -> None:
+        """Grandfather agents that were ALREADY on transport='tmux'.
+
+        ``tmux_bootstrapped`` marks "this agent has completed at least one
+        tmux launch", and drives the one-shot fresh-context forcing on the
+        first tmux boot after an sdk→tmux migration (see
+        ``_start_streaming_session``). Agents that were already running the
+        tmux transport when this marker landed have their own healthy tmux
+        transcripts and MUST keep resuming them with ``claude --continue``,
+        so mark them bootstrapped once at migration time.
+        """
+        marker = "migration:tmux_bootstrapped_backfill"
+        if self.get_setting(marker) == "1":
+            return
+        rows = self._db.execute(
+            "SELECT name FROM agents WHERE transport='tmux'"
+        ).fetchall()
+        for row in rows:
+            self.set_agent_setting(row[0], "tmux_bootstrapped", "1")
+        self.set_setting(marker, "1")
+        if rows:
+            _log(
+                f"agent_registry: grandfathered {len(rows)} existing tmux "
+                f"agent(s) as tmux_bootstrapped"
+            )
+
+    def is_tmux_bootstrapped(self, agent_name: str) -> bool:
+        """True once this agent has completed at least one tmux launch."""
+        return self.get_agent_setting(agent_name, "tmux_bootstrapped") == "1"
+
+    def mark_tmux_bootstrapped(self, agent_name: str) -> None:
+        """Record that this agent has completed a tmux launch."""
+        self.set_agent_setting(agent_name, "tmux_bootstrapped", "1")
 
     def _warn_codex_runtime_mismatches(self) -> None:
         """Warn when Codex provider rows still have the Claude SDK runtime.
@@ -6318,6 +6365,26 @@ except Exception as exc:
                 raise
 
         return _emit_metrics()
+
+    def increment_pending_wake_attempt(self, pending_id: int) -> int:
+        """Increment attempt_count for a pending wake and return the new count.
+
+        Used to track confirmation failures in the retry loop. Returns the new
+        attempt_count value, or -1 if the wake was not found.
+        """
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                "UPDATE pending_schedule_wakes SET attempt_count = attempt_count + 1 WHERE id = ?",
+                (pending_id,),
+            )
+            if cursor.rowcount == 0:
+                return -1
+            row = self._db.execute(
+                "SELECT attempt_count FROM pending_schedule_wakes WHERE id = ?",
+                (pending_id,),
+            ).fetchone()
+            self._db.commit()
+            return row[0] if row else -1
 
     # ── Heartbeats ─────────────────────────────────────────
 

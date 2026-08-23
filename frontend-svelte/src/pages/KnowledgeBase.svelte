@@ -66,6 +66,7 @@
     let detailContent = '';
     let detailKind = 'raw'; // 'raw' or 'wiki'
     let detailReq = 0;
+    let detailContentLoaded = false; // Flag: content was successfully fetched
 
     // Ingest modal
     let ingestModalOpen = false;
@@ -305,13 +306,20 @@
         detailKind = 'raw';
         detailItem = source;
         detailContent = '';
+        detailContentLoaded = false; // Reset: not yet loaded
         detailModalOpen = true;
         const myReq = ++detailReq;
         try {
             const data = await api('GET', `/kb/raw/${source.id}?include_content=true`);
             if (myReq !== detailReq) return;
             detailContent = data.content || data.source?.content || '';
-        } catch (e) { if (myReq === detailReq) detailContent = '_Failed to load content_'; }
+            detailContentLoaded = true; // Success: mark as loaded
+        } catch (e) {
+            if (myReq === detailReq) {
+                detailContent = '_Failed to load content_';
+                detailContentLoaded = false; // Failure: not loaded
+            }
+        }
     }
 
     async function openWikiDetail(page) {
@@ -432,7 +440,10 @@
         editType = source.source_type || 'note';
         editUrl = source.source_url || '';
         editNotes = source.owner_notes || '';
-        editContent = content || '';
+        // Only set editContent if it was successfully loaded. If not (or empty due to
+        // failure), leave it empty and omit it from the update so backend doesn't touch
+        // the body. This prevents the placeholder text from overwriting real content.
+        editContent = detailContentLoaded ? (content || '') : '';
         editModalOpen = true;
     }
 
@@ -449,7 +460,14 @@
             if (editType) body.source_type = editType;
             body.source_url = editUrl.trim();
             body.owner_notes = editNotes.trim();
-            body.content = editContent.trim();
+
+            // Issue #491: Only include content if it was successfully loaded.
+            // If content load failed (GET error), detailContentLoaded is false.
+            // Don't send the field at all (omit = None = backend ignores it).
+            // This prevents placeholder text from overwriting the real body.
+            if (detailContentLoaded) {
+                body.content = editContent.trim();
+            }
 
             await api('PUT', `/kb/raw/${editId}`, body);
             toast('Source updated');
@@ -933,7 +951,8 @@
         {#if detailKind === 'raw'}
             <div class="detail-actions">
                 <button class="action-btn edit-btn" on:click={() => openEditModal(detailItem, detailContent)}
-                    title="Edit source">
+                    disabled={!detailContentLoaded}
+                    title={detailContentLoaded ? "Edit source" : "Waiting for content to load..."}>
                     <span class="material-symbols-outlined" style="font-size:15px">edit</span> Edit
                 </button>
                 <button class="action-btn delete-btn"

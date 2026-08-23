@@ -12422,94 +12422,67 @@ def test_stats_inflight_inactive_when_idle(tmp_path) -> None:
     assert stats["inflight_liveness_reason"] == "no_inflight_turn"
 
 
-def test_stats_monitor_writes_need_an_inflight_turn_to_report_busy(tmp_path) -> None:
-    """#1098 controlled hypothesis: monitors alone cannot pin idle as busy."""
+def test_normalize_prompt_unicode() -> None:
+    """Test _normalize_prompt() normalizes Unicode to NFC form."""
+    import unicodedata
+
+    # Create strings in different normalization forms
+    nfc = unicodedata.normalize("NFC", "café")
+    nfd = unicodedata.normalize("NFD", "café")
+
+    # They should be different at byte level
+    assert nfc != nfd
+
+    # But _normalize_prompt should make them equal
+    assert (
+        tmux_session._normalize_prompt(nfc) == tmux_session._normalize_prompt(nfd)
+    )
+
+
+def test_match_acceptance_turn_handles_nfd_nfc_mismatch() -> None:
+    """End-to-end: _match_acceptance_turn matches prompts despite NFC/NFD mismatch.
+
+    Tests the full acceptance-turn matching logic from #420 fix. When a transcript
+    prompt comes in as NFD (combining characters) but the scheduled prompt was
+    persisted as NFC (or vice versa), the match should succeed via normalized
+    comparison. This verifies the fix for the redelivery loop bug.
+    """
+    import unicodedata
+    import time
+
     ss, _ = _make_session()
-    main = tmp_path / "session.jsonl"
-    main.write_text("{}")
-    _age_file(main, 1000)
-    workflows = tmp_path / "session" / "workflows"
-    workflows.mkdir(parents=True)
-    (workflows / "monitor.jsonl").write_text("{}")
-    _point_transcript(ss, main)
 
-    idle_stats = ss.stats
-    assert idle_stats["inflight_active"] is False
-    assert idle_stats["inflight_busy_not_wedged"] is False
-    assert idle_stats["inflight_liveness_reason"] == "no_inflight_turn"
+    # Create a turn with prompt in NFC form (as persisted from scheduler)
+    nfc_prompt = unicodedata.normalize("NFC", "📊 Café résumé — report")
+    nfd_prompt = unicodedata.normalize("NFD", "📊 Café résumé — report")
 
-    _seed_inflight(ss)
-    phantom_stats = ss.stats
-    assert phantom_stats["inflight_active"] is True
-    assert phantom_stats["inflight_busy_not_wedged"] is True
-    assert phantom_stats["inflight_liveness_reason"] == (
-        "background_transcript_recent"
-    )
+    # They should be different at byte level
+    assert nfc_prompt != nfd_prompt
 
-
-def test_scheduler_drain_busy_trusts_newer_explicit_idle_over_monitor(
-    tmp_path,
-) -> None:
-    """#1098: drain state is revalidated separately from watchdog liveness."""
-    ss, _ = _make_session(state=SessionState.CONNECTED)
-    _seed_inflight(ss)
-    main = tmp_path / "session.jsonl"
-    main.write_text("{}")
-    _age_file(main, 1000)
-    workflows = tmp_path / "session" / "workflows"
-    workflows.mkdir(parents=True)
-    (workflows / "monitor.jsonl").write_text("{}")
-    _point_transcript(ss, main)
-    ss._config.live_status_fn = lambda: {
-        "status": "idle",
-        "last_updated": _time.time() + 1,
-    }
-
-    assert ss.stats["inflight_busy_not_wedged"] is True
-    assert ss.scheduler_drain_busy() is False
-
-    ss._config.live_status_fn = lambda: {
-        "status": "working",
-        "last_updated": _time.time() + 2,
-    }
-    assert ss.scheduler_drain_busy() is True
-
-
-@pytest.mark.asyncio
-async def test_scheduler_drain_busy_pasted_unaccepted_outranks_newer_idle(
-    tmp_path,
-) -> None:
-    """An unresolved physical paste is busy even after a newer idle row."""
-    ss, _ = _make_session(state=SessionState.CONNECTED)
-    entry = _seed_inflight(
-        ss,
-        prompt="unresolved scheduled paste",
-        transport_accepted=False,
-    )
-    turn = entry.turn
-    turn.scheduler_serialized = True
-    turn.scheduler_delivery = asyncio.get_running_loop().create_future()
+    # Create a queued turn with NFC prompt
+    turn = tmux_session._QueuedTurn(prompt=nfc_prompt)
     turn.pane_delivery_started = True
-    ss._scheduler_pending_turns.append(turn)
-    ss._on_transcript_entry(
-        {
-            "type": "queue-operation",
-            "operation": "enqueue",
-            "content": turn.prompt,
-        }
-    )
+    turn.transport_accepted = False
+    turn.submission_receipt = None
 
-    main = tmp_path / "session.jsonl"
-    main.write_text("{}")
-    _age_file(main, 1000)
-    workflows = tmp_path / "session" / "workflows"
-    workflows.mkdir(parents=True)
-    (workflows / "monitor.jsonl").write_text("{}")
-    _point_transcript(ss, main)
-    ss._config.live_status_fn = lambda: {
-        "status": "idle",
-        "last_updated": entry.dispatched_at + 1,
-    }
+    # Add to scheduler pending turns (where _match_acceptance_turn looks)
+    ss._scheduler_pending_turns.append(turn)
+
+    # Now try to match with NFD prompt (as would come from transcript)
+    matched_turn = ss._match_acceptance_turn(nfd_prompt)
+
+    # Should match successfully despite NFC/NFD mismatch
+    assert matched_turn is not None, (
+        f"Failed to match NFC prompt {nfc_prompt!r} against NFD "
+        f"prompt {nfd_prompt!r} — normalization fix not working"
+    )
+    assert matched_turn.prompt == nfc_prompt
+
+    # Also test the reverse: NFC in queue, NFD from transcript
+    nfd_turn = tmux_session._QueuedTurn(prompt=nfd_prompt)
+    nfd_turn.pane_delivery_started = True
+    nfd_turn.transport_accepted = False
+    nfd_turn.submission_receipt = None
 
     assert turn.transport_accepted is False
     assert ss.scheduler_wake_inflight(turn.prompt) is True

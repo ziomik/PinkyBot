@@ -85,10 +85,12 @@ class AnalyticsStore:
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            # Runs once per store construction, before any other connection is
+            # handed out. TRUNCATE is persisted in the database header, so the
+            # short-lived connections from _connect() inherit it.
+            configure_rollback_journal(conn, db_label="analytics.db")
             conn.executescript(
                 """
-                PRAGMA journal_mode=WAL;
-
                 CREATE TABLE IF NOT EXISTS analytics_session_facts (
                   session_id TEXT PRIMARY KEY,
                   agent_name TEXT NOT NULL,

@@ -17,7 +17,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 
 try:
     from pinky_memory.store import ReflectionStore
@@ -230,6 +231,7 @@ async def search_agent_chat_history(
                 "timestamp": m.timestamp,
                 "platform": m.platform,
                 "duration_ms": getattr(m, "duration_ms", 0),
+                "truncated": len(m.content) > 500,
             }
             for m in results
         ],
@@ -237,6 +239,76 @@ async def search_agent_chat_history(
         "count": len(results),
         "sessions_searched": len(agent_session_ids),
     }
+
+
+@router.get("/agents/{agent_name}/chat-history/{message_id}")
+async def get_chat_message(agent_name: str, message_id: int):
+    """Get a single chat message with full content (not truncated)."""
+    agent = _agents.get(agent_name)
+    if not agent:
+        raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+    # Verify message belongs to this agent's sessions
+    agent_session_ids = _collect_agent_session_ids(agent_name)
+    message = _store.get_message(message_id)
+    if not message:
+        raise HTTPException(404, f"Message {message_id} not found")
+    if message.session_id not in agent_session_ids and not message.session_id.startswith(f"{agent_name}-"):
+        raise HTTPException(403, "Access denied")
+
+    return {
+        "id": message.id,
+        "session_id": message.session_id,
+        "role": message.role,
+        "content": message.content,
+        "timestamp": message.timestamp,
+        "platform": message.platform,
+        "chat_id": message.chat_id,
+    }
+
+
+@router.patch("/agents/{agent_name}/chat-history/{message_id}")
+async def edit_chat_message(agent_name: str, message_id: int, req: Request):
+    """Edit a chat message's content."""
+    agent = _agents.get(agent_name)
+    if not agent:
+        raise HTTPException(404, f"Agent '{agent_name}' not found")
+    body = await req.json()
+    content = body.get("content", "")
+    if not content.strip():
+        raise HTTPException(400, "Content cannot be empty")
+
+    # Verify message belongs to this agent's sessions (#489)
+    agent_session_ids = _collect_agent_session_ids(agent_name)
+    message = _store.get_message(message_id)
+    if not message:
+        raise HTTPException(404, f"Message {message_id} not found")
+    if message.session_id not in agent_session_ids and not message.session_id.startswith(f"{agent_name}-"):
+        raise HTTPException(403, "Access denied")
+
+    if not _store.edit_message(message_id, content):
+        raise HTTPException(404, f"Message {message_id} not found")
+    return {"ok": True}
+
+
+@router.delete("/agents/{agent_name}/chat-history/{message_id}")
+async def delete_chat_message(agent_name: str, message_id: int):
+    """Delete a chat message."""
+    agent = _agents.get(agent_name)
+    if not agent:
+        raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+    # Verify message belongs to this agent's sessions (#489)
+    agent_session_ids = _collect_agent_session_ids(agent_name)
+    message = _store.get_message(message_id)
+    if not message:
+        raise HTTPException(404, f"Message {message_id} not found")
+    if message.session_id not in agent_session_ids and not message.session_id.startswith(f"{agent_name}-"):
+        raise HTTPException(403, "Access denied")
+
+    if not _store.delete_message(message_id):
+        raise HTTPException(404, f"Message {message_id} not found")
+    return {"ok": True}
 
 
 @router.get("/agents/{agent_name}/memories/stats")
@@ -275,6 +347,73 @@ async def get_memory_links(agent_name: str, memory_id: str):
             })
     store.close()
     return {"links": linked_memories, "count": len(linked_memories)}
+
+
+# ── Memory Editing ────────────────────────────────────────────────────────────
+
+
+class MemoryContentUpdate(BaseModel):
+    content: str
+
+
+def _require_owner(request: Request) -> None:
+    """Refuse anything but a web-UI owner session (#463).
+
+    Memories are rewritten and deleted only by the owner, from the UI. An agent
+    holding a valid internal signature is authenticated but is NOT the owner —
+    no agent may mutate memories, its own included. Reading stays open.
+    """
+    if getattr(request.state, "auth_actor", None) != "owner":
+        raise HTTPException(403, "Only the owner may edit or delete memories")
+
+
+@router.patch("/agents/{agent_name}/memories/{memory_id}")
+async def update_memory(
+    agent_name: str, memory_id: str, body: MemoryContentUpdate, request: Request
+):
+    """Rewrite a memory's content.
+
+    The store invalidates the stale embedding, so the reflection re-enters the
+    heal-on-write backlog and semantic recall stops matching the old wording.
+    """
+    _require_owner(request)
+    content = body.content.strip()
+    if not content:
+        raise HTTPException(400, "Content cannot be empty")
+    store = _get_memory_store(agent_name)
+    if not store.get(memory_id):
+        store.close()
+        raise HTTPException(404, f"Memory '{memory_id}' not found")
+    store.update_content(memory_id, content)
+    updated = store.get(memory_id)
+    store.close()
+    return _reflection_to_dict(updated)
+
+
+@router.delete("/agents/{agent_name}/memories/{memory_id}")
+async def delete_memory(
+    agent_name: str, memory_id: str, request: Request, hard: bool = False
+):
+    """Delete a memory. Soft (reversible) by default.
+
+    The default archives the reflection and logs a `memory_events` row, so the
+    deletion can be undone with `revert_memory_event`. `hard=true` removes the
+    row, its vector and its links outright — there is nothing left to revert.
+    """
+    _require_owner(request)
+    store = _get_memory_store(agent_name)
+    reflection = store.get(memory_id)
+    if not reflection:
+        store.close()
+        raise HTTPException(404, f"Memory '{memory_id}' not found")
+    if hard:
+        store.delete_reflection(memory_id)
+    elif reflection.active:
+        store.archive_reflection(memory_id, reason="ui-delete")
+    # An already-archived reflection is left alone: re-archiving would stack a
+    # second event and bury the undo of the first.
+    store.close()
+    return {"id": memory_id, "deleted": True, "hard": hard}
 
 
 # ── Knowledge Graph ───────────────────────────────────────────────────────────

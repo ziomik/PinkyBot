@@ -81,6 +81,161 @@
     let modalTitle = '';
     let modalBody = '';
 
+    // Edit / delete (#463)
+    let editOpen = false;
+    let editTarget = null;
+    let editContent = '';
+    let editSaving = false;
+    let deleteOpen = false;
+    let deleteTarget = null;
+    let deleteHardStep = false;   // second confirmation, only for the hard delete
+    let deleteBusy = false;
+
+    // Dream edit / delete
+    let dreamEditOpen = false;
+    let dreamEditAgent = '';
+    let dreamEditContent = '';
+    let dreamEditSaving = false;
+    let dreamDeleteOpen = false;
+    let dreamDeleteAgent = '';
+    let dreamDeleteBusy = false;
+
+    function openDreamEdit(ds) {
+        dreamEditAgent = ds.agent_name;
+        dreamEditContent = ds.last_summary || '';
+        dreamEditOpen = true;
+    }
+    async function saveDreamEdit() {
+        if (!dreamEditContent.trim() || !dreamEditAgent) return;
+        dreamEditSaving = true;
+        try {
+            await api('PATCH', `/agents/${dreamEditAgent}/dream`, { summary: dreamEditContent });
+            const idx = dreamStates.findIndex(d => d.agent_name === dreamEditAgent);
+            if (idx >= 0) dreamStates[idx].last_summary = dreamEditContent;
+            dreamStates = dreamStates;
+            dreamEditOpen = false;
+            toast($_('memories.dream_edit_saved') || 'Dream updated');
+        } catch (e) { toast(`Edit failed: ${e.message}`, 'error'); }
+        finally { dreamEditSaving = false; }
+    }
+    function openDreamDelete(ds) {
+        dreamDeleteAgent = ds.agent_name;
+        dreamDeleteOpen = true;
+    }
+    async function confirmDreamDelete() {
+        dreamDeleteBusy = true;
+        try {
+            await api('DELETE', `/agents/${dreamDeleteAgent}/dream`);
+            dreamStates = dreamStates.filter(d => d.agent_name !== dreamDeleteAgent);
+            dreamDeleteOpen = false;
+            toast($_('memories.dream_deleted') || 'Dream deleted');
+        } catch (e) { toast(`Delete failed: ${e.message}`, 'error'); }
+        finally { dreamDeleteBusy = false; }
+    }
+
+    // Chat message edit / delete
+    let chatEditOpen = false;
+    let chatEditMsg = null;
+    let chatEditContent = '';
+    let chatEditSaving = false;
+    let chatEditToken = 0;  // Token to detect if a newer click arrived while GET was in flight
+    let chatDeleteOpen = false;
+    let chatDeleteMsg = null;
+    let chatDeleteBusy = false;
+
+    async function openChatEdit(msg) {
+        const token = ++chatEditToken;  // Increment and capture token for this click
+        chatEditMsg = msg;  // Assign before await (so subsequent clicks see we're loading this msg)
+        try {
+            const fullMsg = await api('GET', `/agents/${currentAgent}/chat-history/${msg.id}`);
+            // Guard against race: if a newer click arrived while GET was in flight, abort silently
+            if (token !== chatEditToken) return;
+            // Use ?? not || to avoid fallback to truncated display value if endpoint changes
+            chatEditContent = fullMsg.content ?? '';
+            chatEditOpen = true;
+        } catch (e) {
+            // Only show error toast if this token is still current (don't spam if user clicked away)
+            if (token === chatEditToken) toast(`Failed to load message: ${e.message}`, 'error');
+        }
+    }
+    async function saveChatEdit() {
+        if (!chatEditContent.trim() || !chatEditMsg) return;
+        chatEditSaving = true;
+        try {
+            await api('PATCH', `/agents/${currentAgent}/chat-history/${chatEditMsg.id}`, { content: chatEditContent });
+            chatEditMsg.content = chatEditContent;
+            chatMessages = chatMessages;
+            chatEditOpen = false;
+            toast('Message updated');
+        } catch (e) { toast(`Edit failed: ${e.message}`, 'error'); }
+        finally { chatEditSaving = false; }
+    }
+    function openChatDelete(msg) {
+        chatDeleteMsg = msg;
+        chatDeleteOpen = true;
+    }
+    async function confirmChatDelete() {
+        chatDeleteBusy = true;
+        try {
+            await api('DELETE', `/agents/${currentAgent}/chat-history/${chatDeleteMsg.id}`);
+            chatMessages = chatMessages.filter(m => m.id !== chatDeleteMsg.id);
+            chatDeleteOpen = false;
+            toast('Message deleted');
+        } catch (e) { toast(`Delete failed: ${e.message}`, 'error'); }
+        finally { chatDeleteBusy = false; }
+    }
+
+    function memId(m) { return m.id || m._id; }
+
+    function openEdit(m) {
+        editTarget = m;
+        editContent = m.content || '';
+        editOpen = true;
+    }
+
+    async function saveEdit() {
+        if (!editTarget || editSaving) return;
+        const content = editContent.trim();
+        if (!content) { toast($_('memories.edit_empty'), 'error'); return; }
+        const id = memId(editTarget);
+        editSaving = true;
+        try {
+            const updated = await api('PATCH', `/agents/${currentAgent}/memories/${id}`, { content });
+            memories = memories.map(m => (memId(m) === id ? { ...m, ...updated } : m));
+            toast($_('memories.updated'));
+            editOpen = false;
+        } catch (e) { toast(`${$_('memories.edit_failed')}: ${e.message}`, 'error'); }
+        finally { editSaving = false; }
+    }
+
+    function openDelete(m) {
+        deleteTarget = m;
+        deleteHardStep = false;
+        deleteOpen = true;
+    }
+
+    async function confirmDelete(hard) {
+        if (!deleteTarget || deleteBusy) return;
+        // The permanent delete is the one that cannot be walked back, so it
+        // costs a second, explicit click.
+        if (hard && !deleteHardStep) { deleteHardStep = true; return; }
+        const id = memId(deleteTarget);
+        deleteBusy = true;
+        try {
+            await api('DELETE', `/agents/${currentAgent}/memories/${id}${hard ? '?hard=true' : ''}`);
+            if (hard || activeOnly) {
+                // Gone, or no longer matching the active-only filter.
+                memories = memories.filter(m => memId(m) !== id);
+                totalCount = Math.max(0, totalCount - 1);
+            } else {
+                memories = memories.map(m => (memId(m) === id ? { ...m, active: false } : m));
+            }
+            toast(hard ? $_('memories.deleted') : $_('memories.archived'));
+            deleteOpen = false;
+        } catch (e) { toast(`${$_('memories.delete_failed')}: ${e.message}`, 'error'); }
+        finally { deleteBusy = false; }
+    }
+
     async function init() {
         try {
             const agents = await api('GET', '/agents');
@@ -647,7 +802,11 @@
                             <span>{m.access_count || 0} views</span>
                             <span>w: {m.weight != null ? m.weight.toFixed(2) : '--'}</span>
                         </div>
-                        {#if !isActive}<span style="color:var(--red)">INACTIVE</span>{/if}
+                        <div class="card-actions">
+                            {#if !isActive}<span style="color:var(--red)">INACTIVE</span>{/if}
+                            <button class="card-action" title={$_('common.edit')} aria-label={$_('common.edit')} on:click|stopPropagation={() => openEdit(m)}>✎</button>
+                            <button class="card-action danger" title={$_('common.delete')} aria-label={$_('common.delete')} on:click|stopPropagation={() => openDelete(m)}>✕</button>
+                        </div>
                     </div>
                 </div>
             {/each}
@@ -864,6 +1023,10 @@
                         {#if msg.duration_ms}
                             <span class="chat-duration">{(msg.duration_ms / 1000).toFixed(1)}s</span>
                         {/if}
+                        <span style="margin-left:auto;display:flex;gap:0.3rem">
+                            <button class="card-action" title="Edit" on:click={() => openChatEdit(msg)}>✎</button>
+                            <button class="card-action danger" title="Delete" on:click={() => openChatDelete(msg)}>✕</button>
+                        </span>
                     </div>
                     <div class="chat-item-content">{msg.content}</div>
                 </div>
@@ -887,6 +1050,8 @@
                             <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">
                                 {ds.last_dream_at ? new Date(ds.last_dream_at * 1000).toLocaleString() : 'Never'}
                             </span>
+                            <button class="card-action" title="Edit" on:click={() => openDreamEdit(ds)}>✎</button>
+                            <button class="card-action danger" title="Delete" on:click={() => openDreamDelete(ds)}>✕</button>
                             <button class="btn btn-sm btn-primary" disabled={dreamingAgent !== null} on:click={() => triggerDream(ds.agent_name)}>{dreamingAgent === ds.agent_name ? $_('agents.dreaming') : $_('memories.dream_now')}</button>
                         </div>
                     </div>
@@ -904,6 +1069,78 @@
 
 <Modal bind:show={modalOpen} title={modalTitle} width="700px" maxWidth="700px">
     {@html modalBody}
+</Modal>
+
+<!-- Edit memory (#463) -->
+<Modal bind:show={editOpen} title={$_('memories.edit_title')} width="640px" maxWidth="640px">
+    <textarea class="edit-textarea" bind:value={editContent} rows="10" placeholder={$_('memories.edit_title')}></textarea>
+    <div class="edit-hint">{$_('memories.edit_hint')}</div>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => editOpen = false} disabled={editSaving}>{$_('common.cancel')}</button>
+        <button class="btn btn-primary" on:click={saveEdit} disabled={editSaving || !editContent.trim()}>
+            {editSaving ? $_('common.saving') : $_('common.save')}
+        </button>
+    </svelte:fragment>
+</Modal>
+
+<!-- Delete memory (#463) -->
+<Modal bind:show={deleteOpen} title={$_('memories.delete_title')} width="560px" maxWidth="560px">
+    {#if deleteTarget}
+        <div class="delete-preview">{(deleteTarget.content || '').substring(0, 300)}</div>
+    {/if}
+    <div class="edit-hint">{deleteHardStep ? $_('memories.delete_hard_confirm') : $_('memories.delete_explain')}</div>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => deleteOpen = false} disabled={deleteBusy}>{$_('common.cancel')}</button>
+        {#if !deleteHardStep}
+            <button class="btn" on:click={() => confirmDelete(true)} disabled={deleteBusy}>{$_('memories.delete_hard')}</button>
+            <button class="btn btn-primary" on:click={() => confirmDelete(false)} disabled={deleteBusy}>{$_('memories.delete_archive')}</button>
+        {:else}
+            <button class="btn btn-danger" on:click={() => confirmDelete(true)} disabled={deleteBusy}>{$_('memories.delete_hard')}</button>
+        {/if}
+    </svelte:fragment>
+</Modal>
+
+<!-- Edit chat message -->
+<Modal bind:show={chatEditOpen} title="Edit Message" width="640px" maxWidth="640px">
+    <textarea class="edit-textarea" bind:value={chatEditContent} rows="8" placeholder="Message content..."></textarea>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => chatEditOpen = false} disabled={chatEditSaving}>{$_('common.cancel')}</button>
+        <button class="btn btn-primary" on:click={saveChatEdit} disabled={chatEditSaving || !chatEditContent.trim()}>
+            {chatEditSaving ? $_('common.saving') : $_('common.save')}
+        </button>
+    </svelte:fragment>
+</Modal>
+
+<!-- Delete chat message -->
+<Modal bind:show={chatDeleteOpen} title="Delete Message" width="560px" maxWidth="560px">
+    {#if chatDeleteMsg}
+        <div class="delete-preview">{(chatDeleteMsg.content || '').substring(0, 300)}</div>
+    {/if}
+    <div class="edit-hint">This will permanently delete this message from chat history.</div>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => chatDeleteOpen = false} disabled={chatDeleteBusy}>{$_('common.cancel')}</button>
+        <button class="btn btn-danger" on:click={confirmChatDelete} disabled={chatDeleteBusy}>Delete</button>
+    </svelte:fragment>
+</Modal>
+
+<!-- Edit dream summary -->
+<Modal bind:show={dreamEditOpen} title="Edit Dream Summary" width="640px" maxWidth="640px">
+    <textarea class="edit-textarea" bind:value={dreamEditContent} rows="10" placeholder="Dream summary..."></textarea>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => dreamEditOpen = false} disabled={dreamEditSaving}>{$_('common.cancel')}</button>
+        <button class="btn btn-primary" on:click={saveDreamEdit} disabled={dreamEditSaving || !dreamEditContent.trim()}>
+            {dreamEditSaving ? $_('common.saving') : $_('common.save')}
+        </button>
+    </svelte:fragment>
+</Modal>
+
+<!-- Delete dream -->
+<Modal bind:show={dreamDeleteOpen} title="Delete Dream" width="560px" maxWidth="560px">
+    <div class="edit-hint">This will permanently delete the dream state for <strong>{dreamDeleteAgent}</strong>. The agent can dream again to create a new one.</div>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => dreamDeleteOpen = false} disabled={dreamDeleteBusy}>{$_('common.cancel')}</button>
+        <button class="btn btn-danger" on:click={confirmDreamDelete} disabled={dreamDeleteBusy}>Delete</button>
+    </svelte:fragment>
 </Modal>
 
 <style>
@@ -953,6 +1190,13 @@
     .card-tag.source { background: var(--tone-warning-bg); color: var(--tone-warning-text); }
     .card-footer { display: flex; justify-content: space-between; align-items: center; font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); padding-top: 0.6rem; }
     .card-footer-left { display: flex; gap: 1rem; }
+    .card-actions { display: flex; gap: 0.35rem; align-items: center; }
+    .card-action { border: none; background: transparent; cursor: pointer; color: var(--text-muted); font-size: 0.85rem; line-height: 1; padding: 0.2rem 0.35rem; border-radius: var(--radius-md); }
+    .card-action:hover { background: var(--surface-3); color: var(--text); }
+    .card-action.danger:hover { background: var(--tone-error-bg); color: var(--tone-error-text); }
+    .edit-textarea { width: 100%; box-sizing: border-box; font-family: var(--font-body); font-size: 0.85rem; line-height: 1.6; padding: 0.7rem; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-1); color: var(--text); resize: vertical; }
+    .edit-hint { font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); margin-top: 0.6rem; }
+    .delete-preview { font-family: var(--font-body); font-size: 0.85rem; line-height: 1.6; white-space: pre-wrap; padding: 0.7rem; background: var(--surface-2); border-radius: var(--radius-md); }
     .pagination { display: flex; justify-content: center; gap: 0.5rem; margin-top: 1.5rem; }
 
     :global(.detail-field) { margin-bottom: 1rem; }

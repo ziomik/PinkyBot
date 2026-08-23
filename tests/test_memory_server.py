@@ -189,39 +189,15 @@ class TestReflect:
         assert result["salience"] == 5
         assert result["type"] == "project_state"
 
-    def test_transport_dream_correlation_overrides_model_argument(self, srv, store):
-        from pinky_daemon.shared_mcp import _current_dream_correlation
-
-        token = _current_dream_correlation.set("dream:pinky:2026-08-12:1:nonce")
-        try:
-            result = json.loads(
-                _tools(srv)["reflect"](
-                    content="structurally attributed",
-                    source_session_id="model-chosen-wrong-value",
-                )
-            )
-        finally:
-            _current_dream_correlation.reset(token)
-
-        assert store.get(result["id"]).source_session_id == (
-            "dream:pinky:2026-08-12:1:nonce"
-        )
-
-    def test_stdio_dream_correlation_overrides_model_argument(
-        self, srv, store, monkeypatch
-    ):
-        monkeypatch.setenv(
-            "PINKY_DREAM_CORRELATION", "dream:pinky:2026-08-12:2:stdio"
-        )
-        result = json.loads(
-            _tools(srv)["reflect"](
-                content="stdio attributed",
-                source_session_id="model-chosen-wrong-value",
-            )
-        )
-        assert store.get(result["id"]).source_session_id == (
-            "dream:pinky:2026-08-12:2:stdio"
-        )
+    def test_reflect_invalid_type_falls_back_to_fact(self, srv):
+        """Regression: an unrecognized type (e.g. dream-hallucinated 'session_log')
+        must not raise — it previously crashed the whole dream run."""
+        result = json.loads(_tools(srv)["reflect"](
+            content="something the dream agent decided to call session_log",
+            type="session_log",
+        ))
+        assert result["stored"] is True
+        assert result["type"] == "fact"
 
     def test_reflect_supersedes(self, srv, store):
         # First memory

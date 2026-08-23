@@ -396,6 +396,61 @@ class ConversationStore:
         self._conn.commit()
         return cursor.rowcount
 
+    def prune(self, *, max_age_days: int = 30) -> int:
+        """Delete messages older than *max_age_days* and compact the DB.
+
+        The DELETE trigger ``messages_ad`` keeps the FTS5 index consistent, so
+        no manual FTS cleanup is needed. After deletion the WAL is checkpointed
+        and the FTS shadow tables are optimised (merges tombstones) to reclaim
+        space without a full VACUUM (which requires an exclusive lock).
+
+        Returns the number of rows deleted.
+        """
+        cutoff = time.time() - max_age_days * 86400
+        cursor = self._conn.execute(
+            "DELETE FROM messages WHERE timestamp < ?", (cutoff,)
+        )
+        self._conn.commit()
+        deleted = cursor.rowcount
+        if deleted > 0:
+            # Merge FTS5 tombstones without a full exclusive-lock rebuild.
+            try:
+                self._conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('optimize')")
+                self._conn.commit()
+            except Exception:
+                pass
+            # NOTE: do NOT run wal_checkpoint(TRUNCATE) here — the daemon keeps
+            # an active connection in WAL mode and a TRUNCATE checkpoint while
+            # writers are active corrupts the FTS5 shadow tables (Tree 7).
+            # Space is reclaimed gradually by SQLite's automatic checkpointing.
+        return deleted
+
+    def edit_message(self, message_id: int, content: str) -> bool:
+        """Update the content of a message by its integer ID.  Returns True if updated."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ?",
+                (content, message_id),
+            )
+            return cur.rowcount > 0
+
+    def get_message(self, message_id: int) -> StoredMessage | None:
+        """Get a single message by its integer ID."""
+        row = self._conn.execute(
+            "SELECT * FROM messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+        return self._row_to_message(row) if row else None
+
+    def delete_message(self, message_id: int) -> bool:
+        """Delete a message by its integer ID.  Returns True if deleted."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM messages WHERE id = ?",
+                (message_id,),
+            )
+            return cur.rowcount > 0
+
     def close(self) -> None:
         """Close the calling thread's connection, if it has opened one.
 

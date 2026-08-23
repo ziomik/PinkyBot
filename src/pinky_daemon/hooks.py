@@ -23,6 +23,8 @@ from enum import Enum
 from pinky_daemon.audit_store import AuditEntry as AuditEntry
 from pinky_daemon.audit_store import AuditStore
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)

@@ -250,6 +250,17 @@ async def test_cold_start_caps_concurrent_subagents_in_spawn_env() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cold_start_marks_pane_for_transcript_bind_hook() -> None:
+    """Only daemon-launched tmux panes may report SessionStart binds."""
+    ss, tmux = _make_session()
+
+    await ss.connect()
+
+    env = tmux.new_session.await_args.kwargs["env"]
+    assert env["PINKY_TMUX_TRANSCRIPT_BIND"] == "1"
+
+
+@pytest.mark.asyncio
 async def test_cold_start_failure_drives_to_dead_via_boot_failed() -> None:
     """If ``tmux new-session`` fails, cold-start lands BOOTING → DEAD via
     BOOT_FAILED (not silent disconnect)."""
@@ -2643,10 +2654,189 @@ async def test_set_transcript_path_forwards_to_tailer(tmp_path) -> None:
     await ss.connect()
     new_path = tmp_path / "new-session.jsonl"
     new_path.touch()
-    ss.set_transcript_path(new_path)
+    ss.set_transcript_path(new_path, session_id="test-session-id")
     assert ss._tailer.transcript_path == new_path
     # Offset reset on rotation (per tailer contract).
     assert ss._tailer.offset == 0
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_transcript_bind_rejects_foreign_mid_session(
+    tmp_path,
+    capsys,
+) -> None:
+    """#1148: a sibling headless session cannot replace the REPL tailer."""
+    ss, _ = _make_session()
+    await ss.connect()
+    original = tmp_path / "repl-session.jsonl"
+    foreign = tmp_path / "librarian-session.jsonl"
+    original.touch()
+    foreign.touch()
+
+    assert ss.set_transcript_path(
+        original,
+        session_id="repl-session-id",
+    ) is True
+    assert ss._tailer.transcript_path == original
+    assert ss._session_ready_event.is_set()
+
+    assert ss.set_transcript_path(
+        foreign,
+        session_id="librarian-session-id",
+    ) is False
+
+    assert ss._tailer.transcript_path == original
+    assert ss._bound_transcript_session_id == "repl-session-id"
+    assert ss._session_ready_event.is_set()
+    assert ss.stats["transcript_bind_rejections"] == 1
+    assert "TRANSCRIPT_BIND_REJECTED" in capsys.readouterr().err
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_transcript_bind_continue_window_rejects_foreign_session(
+    tmp_path,
+    capsys,
+) -> None:
+    """A continue relaunch cannot admit a different session lineage."""
+    ss, _ = _make_session()
+    await ss.connect()
+    original = tmp_path / "continued-session.jsonl"
+    foreign = tmp_path / "foreign-session.jsonl"
+    original.touch()
+    foreign.touch()
+
+    assert ss.set_transcript_path(
+        original,
+        session_id="continued-session-id",
+    ) is True
+
+    ss._last_launch_used_continue = True
+    ss._tailer_first_bind_pending = True
+
+    assert ss.set_transcript_path(
+        foreign,
+        session_id="foreign-session-id",
+    ) is False
+    assert ss._tailer.transcript_path == original
+    assert ss._bound_transcript_session_id == "continued-session-id"
+    assert ss._tailer_first_bind_pending is True
+    assert ss.stats["transcript_bind_rejections"] == 1
+    rejection_log = capsys.readouterr().err
+    assert "TRANSCRIPT_BIND_REJECTED" in rejection_log
+    assert "reason=foreign_session_id" in rejection_log
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_id", ["", "   "], ids=["empty", "blank"])
+async def test_transcript_bind_rejects_absent_session_id_without_consuming_window(
+    tmp_path,
+    session_id,
+) -> None:
+    """Fail closed on absence, while preserving the real pane's bind chance."""
+    ss, _ = _make_session()
+    await ss.connect()
+    original_path = ss._tailer.transcript_path
+    candidate = tmp_path / "missing-lineage.jsonl"
+    candidate.touch()
+
+    assert ss._tailer_first_bind_pending is True
+    assert ss.set_transcript_path(candidate, session_id=session_id) is False
+    assert ss._tailer.transcript_path == original_path
+    assert ss._tailer_first_bind_pending is True
+    assert not ss._session_ready_event.is_set()
+    assert ss.stats["transcript_bind_rejections"] == 1
+
+    assert ss.set_transcript_path(
+        candidate,
+        session_id="real-pane-session-id",
+    ) is True
+    assert ss._tailer.transcript_path == candidate
+    assert ss._bound_transcript_session_id == "real-pane-session-id"
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_transcript_bind_accepts_fresh_and_same_lineage_repeat(tmp_path) -> None:
+    """A fresh pane establishes lineage; later same-lineage posts stay valid."""
+    ss, _ = _make_session()
+    await ss.connect()
+    first = tmp_path / "fresh.jsonl"
+    repeated = tmp_path / "fresh-rotated.jsonl"
+    first.touch()
+    repeated.touch()
+
+    assert ss.set_transcript_path(first, session_id="fresh-session-id") is True
+    assert ss._tailer_first_bind_pending is False
+    assert ss.set_transcript_path(
+        repeated,
+        session_id="fresh-session-id",
+    ) is True
+    assert ss._tailer.transcript_path == repeated
+    assert ss.stats["transcript_bind_rejections"] == 0
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_transcript_bind_continue_window_accepts_bound_session(
+    tmp_path,
+    capsys,
+) -> None:
+    """A continue relaunch still accepts the resumed session's own hook."""
+    ss, _ = _make_session()
+    await ss.connect()
+    original = tmp_path / "continued-session.jsonl"
+    resumed = tmp_path / "continued-session-rotated.jsonl"
+    original.touch()
+    resumed.touch()
+    assert ss.set_transcript_path(
+        original,
+        session_id="continued-session-id",
+    ) is True
+
+    await ss._stop_tailer()
+    await ss._start_tailer()
+    ss._last_launch_used_continue = True
+
+    assert ss._tailer_first_bind_pending is True
+    assert ss.set_transcript_path(
+        resumed,
+        session_id="continued-session-id",
+    ) is True
+    assert ss._bound_transcript_session_id == "continued-session-id"
+    assert ss._tailer.transcript_path == resumed
+    assert ss.stats["transcript_bind_rejections"] == 0
+    assert "TRANSCRIPT_BIND_REJECTED" not in capsys.readouterr().err
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_transcript_bind_fresh_window_accepts_new_session(tmp_path) -> None:
+    """A fresh relaunch still admits its legitimately new session lineage."""
+    ss, _ = _make_session()
+    await ss.connect()
+    old_path = tmp_path / "old-session.jsonl"
+    new_path = tmp_path / "new-session.jsonl"
+    old_path.touch()
+    new_path.touch()
+    assert ss.set_transcript_path(
+        old_path,
+        session_id="old-session-id",
+    ) is True
+
+    await ss._stop_tailer()
+    await ss._start_tailer()
+    ss._last_launch_used_continue = False
+
+    assert ss._tailer_first_bind_pending is True
+    assert ss.set_transcript_path(
+        new_path,
+        session_id="new-session-id",
+    ) is True
+    assert ss._bound_transcript_session_id == "new-session-id"
+    assert ss._tailer.transcript_path == new_path
     await ss.disconnect()
 
 
@@ -2655,7 +2845,10 @@ async def test_set_transcript_path_safe_before_connect(tmp_path) -> None:
     """set_transcript_path before tailer exists is a silent no-op."""
     ss, _ = _make_session()
     # Don't connect — tailer is None.
-    ss.set_transcript_path(tmp_path / "x.jsonl")  # must not raise
+    ss.set_transcript_path(
+        tmp_path / "x.jsonl",
+        session_id="test-session-id",
+    )  # must not raise
     assert ss._tailer is None
 
 
@@ -2674,7 +2867,7 @@ async def test_end_to_end_tailer_to_response_callback(tmp_path) -> None:
     # Replace the tailer's path with our synthetic transcript.
     transcript = tmp_path / "synthetic.jsonl"
     transcript.write_text("")
-    ss.set_transcript_path(transcript)
+    ss.set_transcript_path(transcript, session_id="test-session-id")
 
     # Simulate _deliver_turn capturing routing meta.
     ss._inflight_meta = {
@@ -2818,7 +3011,7 @@ async def test_set_transcript_path_from_placeholder_seeks_to_start(
     assert transcript.stat().st_size > 0, "pre-condition: JSONL has content"
 
     # SessionStart hook fires AFTER the content was written.
-    ss.set_transcript_path(transcript)
+    ss.set_transcript_path(transcript, session_id="test-session-id")
     assert ss._tailer.transcript_path == transcript
     assert ss._tailer.offset == 0, (
         "placeholder→real transition must seek to byte 0 — otherwise "
@@ -2903,7 +3096,7 @@ async def test_set_transcript_path_fresh_launch_old_real_to_new_real_seeks_to_st
     new_real.write_text("\n".join(_json.dumps(e) for e in entries) + "\n")
 
     # SessionStart hook lands.
-    ss.set_transcript_path(new_real)
+    ss.set_transcript_path(new_real, session_id="test-session-id")
     assert ss._tailer.transcript_path == new_real
     assert ss._tailer.offset == 0, (
         "fresh-launch old-real→new-real transition must seek to byte 0 — "
@@ -2970,7 +3163,7 @@ async def test_set_transcript_path_continue_launch_old_real_to_new_real_preserve
     other.write_text("\n".join(_json.dumps(e) for e in historical_entries) + "\n")
     historical_size = other.stat().st_size
 
-    ss.set_transcript_path(other)
+    ss.set_transcript_path(other, session_id="test-session-id")
     assert ss._tailer.transcript_path == other
     assert ss._tailer.offset == historical_size, (
         "continue-launch path swap must seek to EOF — #496 reply-spam "
@@ -3089,6 +3282,76 @@ async def test_first_bind_recovery_fresh_with_prior_history_rebinds_and_seeks_to
     assert len(cb.calls) == 1
     assert cb.calls[0].response_text == "recovered fresh reply"
 
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_late_hook_establishes_lineage_after_internal_recovery(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """#1148: an authoritative late hook can correct recovery's mtime guess."""
+    ss, _ = _make_session()
+    await ss.connect()
+    recovered_guess = tmp_path / "newest-sibling.jsonl"
+    authoritative = tmp_path / "real-pane.jsonl"
+    recovered_guess.touch()
+    authoritative.touch()
+    ss._last_launch_used_continue = False
+    monkeypatch.setattr(
+        ss,
+        "_discover_transcript_path",
+        lambda: recovered_guess,
+    )
+
+    ss._attempt_first_bind_recovery()
+
+    assert ss._tailer.transcript_path == recovered_guess
+    assert ss._tailer_first_bind_pending is False
+    assert ss._bound_transcript_session_id == ""
+    assert ss.set_transcript_path(
+        authoritative,
+        session_id="real-pane-session-id",
+    ) is True
+    assert ss._bound_transcript_session_id == "real-pane-session-id"
+    assert ss._tailer.transcript_path == authoritative
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_late_hook_lineage_rejects_foreign_followup(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Once the late hook establishes lineage, ordinary mismatch rules resume."""
+    ss, _ = _make_session()
+    await ss.connect()
+    recovered_guess = tmp_path / "newest-sibling.jsonl"
+    authoritative = tmp_path / "real-pane.jsonl"
+    foreign = tmp_path / "later-foreign.jsonl"
+    recovered_guess.touch()
+    authoritative.touch()
+    foreign.touch()
+    ss._last_launch_used_continue = False
+    monkeypatch.setattr(
+        ss,
+        "_discover_transcript_path",
+        lambda: recovered_guess,
+    )
+
+    ss._attempt_first_bind_recovery()
+    assert ss.set_transcript_path(
+        authoritative,
+        session_id="real-pane-session-id",
+    ) is True
+
+    assert ss.set_transcript_path(
+        foreign,
+        session_id="foreign-session-id",
+    ) is False
+    assert ss._bound_transcript_session_id == "real-pane-session-id"
+    assert ss._tailer.transcript_path == authoritative
+    assert ss.stats["transcript_bind_rejections"] == 1
     await ss.disconnect()
 
 
@@ -3377,7 +3640,7 @@ async def test_start_tailer_rearms_first_bind_state_on_retained_instance_respawn
     # instance so the next spawn can resume from its last path.
     fake_path = tmp_path / "retained-instance.jsonl"
     fake_path.write_text("")
-    ss.set_transcript_path(fake_path)
+    ss.set_transcript_path(fake_path, session_id="test-session-id")
     assert ss._tailer_first_bind_pending is False, (
         "explicit bind must consume the flag — sanity check before "
         "exercising the respawn re-arm"
@@ -3444,7 +3707,7 @@ async def test_first_bind_recovery_after_retained_instance_respawn_rebinds_and_s
     # the tailer (retaining the instance).
     first_real = tmp_path / "first.jsonl"
     first_real.write_text("")
-    ss.set_transcript_path(first_real)
+    ss.set_transcript_path(first_real, session_id="test-session-id")
     assert ss._tailer_first_bind_pending is False
     await ss._stop_tailer()
 
@@ -3526,7 +3789,7 @@ async def test_set_transcript_path_real_to_real_preserves_seek_to_eof(tmp_path) 
     # seeks to start, but file is empty so offset stays 0).
     first_real = tmp_path / "first.jsonl"
     first_real.write_text("")
-    ss.set_transcript_path(first_real)
+    ss.set_transcript_path(first_real, session_id="test-session-id")
     assert ss._tailer.transcript_path == first_real
 
     # Second real path — has prior turns already (simulating compact-resume
@@ -3568,7 +3831,7 @@ async def test_set_transcript_path_real_to_real_preserves_seek_to_eof(tmp_path) 
     second_real.write_text("\n".join(_json.dumps(e) for e in historical_entries) + "\n")
     historical_size = second_real.stat().st_size
 
-    ss.set_transcript_path(second_real)
+    ss.set_transcript_path(second_real, session_id="test-session-id")
     assert ss._tailer.transcript_path == second_real
     assert ss._tailer.offset == historical_size, (
         "real→real swap must seek to EOF (#496 reply-spam defense) — "
@@ -4640,7 +4903,7 @@ async def test_multi_prompt_routing_no_cross_user_leak(tmp_path) -> None:
     # Repoint tailer at our synthetic transcript.
     transcript = tmp_path / "session.jsonl"
     transcript.write_text("")
-    ss.set_transcript_path(transcript)
+    ss.set_transcript_path(transcript, session_id="test-session-id")
     # Use tight cadences so the test runs fast.
     ss._tailer._fallback_poll_sec = 0.02
     ss._tailer._active_poll_sec = 0.01
@@ -5600,6 +5863,74 @@ async def test_idle_phantom_verified_consumed_resolves_scheduler_true(
 
 
 @pytest.mark.asyncio
+async def test_idle_phantom_delayed_proof_rechecks_before_requeue(
+    monkeypatch, tmp_path,
+) -> None:
+    """#1156: proof landing one watchdog tick late suppresses duplicate replay."""
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.01)
+    decisions = MagicMock()
+    monkeypatch.setattr(tmux_session, "log_watchdog_decision", decisions)
+
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+    ss._transcript_recently_grew = lambda *_args: False
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"system"}\n')
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+
+    completion = asyncio.Event()
+    delivery = asyncio.get_running_loop().create_future()
+    durable_accept = MagicMock(return_value=True)
+    prompt = "[agent | sender | internal | 2026-08-25T17:09:36-07:00]\nbody"
+    entry = _seed_inflight(
+        ss,
+        prompt=prompt,
+        completion_event=completion,
+        transport_accepted=False,
+    )
+    _bind_transcript_ticket(entry, transcript)
+    entry.turn.scheduler_delivery = delivery
+    entry.turn.scheduler_accept = durable_accept
+    backlog = _QueuedTurn(prompt="later backlog")
+    ss._message_queue.put_nowait(backlog)
+
+    original_probe = ss._phantom_consumption_verdicts
+    probe_results: list[list[bool | None]] = []
+
+    def probe_with_delayed_proof(candidates: list[_InflightMeta]) -> list[bool | None]:
+        verdicts = original_probe(candidates)
+        probe_results.append(verdicts)
+        if len(probe_results) == 1:
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    _json.dumps({"type": "user", "message": {"content": prompt}})
+                    + "\n"
+                )
+        return verdicts
+
+    monkeypatch.setattr(ss, "_phantom_consumption_verdicts", probe_with_delayed_proof)
+    ss._head_started_at = _time.time() - 1.0
+
+    await _run_idle_reconcile(ss)
+
+    assert probe_results == [[False], [True]]
+    assert completion.is_set()
+    assert delivery.result() is True
+    durable_accept.assert_called_once_with()
+    assert entry.turn.replay_count == 0
+    assert ss._message_queue.get_nowait() is backlog
+    assert ss._message_queue.empty()
+    reasons = [call.kwargs.get("reason") for call in decisions.call_args_list]
+    assert reasons.count("phantom_consumption_grace") == 1
+    assert "phantom_requeued_unconsumed" not in reasons
+
+
+@pytest.mark.asyncio
 async def test_idle_phantom_unconsumed_requeues_at_front(monkeypatch, tmp_path) -> None:
     """#1127: a header absent from the transcript is replayed, not completed."""
     monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.01)
@@ -5627,6 +5958,8 @@ async def test_idle_phantom_unconsumed_requeues_at_front(monkeypatch, tmp_path) 
         transport_accepted=False,
     )
     _bind_transcript_ticket(original, transcript)
+    consumption_probe = MagicMock(wraps=ss._phantom_consumption_verdicts)
+    monkeypatch.setattr(ss, "_phantom_consumption_verdicts", consumption_probe)
     backlog = _QueuedTurn(prompt="later backlog")
     ss._message_queue.put_nowait(backlog)
     ss._head_started_at = _time.time() - 1.0
@@ -5634,13 +5967,13 @@ async def test_idle_phantom_unconsumed_requeues_at_front(monkeypatch, tmp_path) 
     await _run_idle_reconcile(ss)
 
     assert not completion.is_set()
+    assert consumption_probe.call_count == 2
     assert original.turn.replay_count == 1
     assert ss._message_queue.get_nowait() is original.turn
     assert ss._message_queue.get_nowait() is backlog
-    assert any(
-        call.kwargs.get("reason") == "phantom_requeued_unconsumed"
-        for call in decisions.call_args_list
-    )
+    reasons = [call.kwargs.get("reason") for call in decisions.call_args_list]
+    assert reasons.count("phantom_consumption_grace") == 1
+    assert reasons.count("phantom_requeued_unconsumed") == 1
 
 
 @pytest.mark.asyncio
@@ -5676,21 +6009,23 @@ async def test_idle_phantom_replay_cap_drops_loudly(
     )
     _bind_transcript_ticket(entry, transcript)
     turn = entry.turn
+    consumption_probe = MagicMock(wraps=ss._phantom_consumption_verdicts)
+    monkeypatch.setattr(ss, "_phantom_consumption_verdicts", consumption_probe)
     turn.submission_receipt = submission
     turn.replay_count = 1
     ss._head_started_at = _time.time() - 1.0
 
     await _run_idle_reconcile(ss)
 
+    assert consumption_probe.call_count == 2
     assert turn.replay_count == 2
     assert completion.is_set()
     assert submission.result() is False
     assert ss._message_queue.empty()
     assert header in capsys.readouterr().err
-    assert any(
-        call.kwargs.get("reason") == "phantom_replay_cap_dropped"
-        for call in decisions.call_args_list
-    )
+    reasons = [call.kwargs.get("reason") for call in decisions.call_args_list]
+    assert reasons.count("phantom_consumption_grace") == 1
+    assert reasons.count("phantom_replay_cap_dropped") == 1
 
 
 @pytest.mark.asyncio
@@ -6271,7 +6606,7 @@ async def test_force_restart_resumes_tailer(tmp_path) -> None:
     # actually deliver a response?
     transcript = tmp_path / "post_restart.jsonl"
     transcript.write_text("")
-    ss.set_transcript_path(transcript)
+    ss.set_transcript_path(transcript, session_id="test-session-id")
 
     ss._inflight_meta = {
         "platform": "telegram",
@@ -6345,7 +6680,7 @@ async def test_stop_tailer_drains_buffer_for_same_path_resume(tmp_path) -> None:
     # Replace the tailer's path with a controlled synthetic transcript.
     transcript = tmp_path / "session_x.jsonl"
     transcript.write_text("")
-    ss.set_transcript_path(transcript)
+    ss.set_transcript_path(transcript, session_id="test-session-id")
 
     # Feed a partial turn — assistant entry without stop_hook_summary.
     # This simulates the in-flight state when a session is killed mid-turn.
@@ -8231,6 +8566,7 @@ class TestWakePromptReadinessGate:
         ss._session_ready_event = asyncio.Event()  # closed
         ss._tailer = MagicMock()
         ss._tailer.set_transcript_path = MagicMock()
+        ss._tailer_first_bind_pending = True
 
         wake_turn = _QueuedTurn(
             prompt="WAKE_BODY",
@@ -8247,7 +8583,10 @@ class TestWakePromptReadinessGate:
         tmux.paste_text.assert_not_called()
 
         # Simulate SessionStart hook arriving.
-        ss.set_transcript_path("/tmp/fake-transcript.jsonl")
+        ss.set_transcript_path(
+            "/tmp/fake-transcript.jsonl",
+            session_id="test-session-id",
+        )
         assert ss._session_ready_event.is_set()
 
         await asyncio.wait_for(deliver_task, timeout=2.0)
@@ -8374,9 +8713,13 @@ class TestWakePromptReadinessGate:
         ss._session_ready_event = asyncio.Event()  # closed
         ss._tailer = MagicMock()
         ss._tailer.set_transcript_path = MagicMock()
+        ss._tailer_first_bind_pending = True
 
         assert not ss._session_ready_event.is_set()
-        ss.set_transcript_path("/tmp/fake-transcript.jsonl")
+        ss.set_transcript_path(
+            "/tmp/fake-transcript.jsonl",
+            session_id="test-session-id",
+        )
         assert ss._session_ready_event.is_set(), (
             "set_transcript_path must open the readiness gate"
         )
@@ -8391,12 +8734,19 @@ class TestWakePromptReadinessGate:
         ss, _ = _make_session()
         ss._tailer = MagicMock()
         ss._tailer.set_transcript_path = MagicMock()
+        ss._tailer_first_bind_pending = True
 
-        ss.set_transcript_path("/tmp/fake-transcript.jsonl")
+        ss.set_transcript_path(
+            "/tmp/fake-transcript.jsonl",
+            session_id="test-session-id",
+        )
         first_event = ss._session_ready_event
         assert first_event.is_set()
 
-        ss.set_transcript_path("/tmp/fake-transcript.jsonl")
+        ss.set_transcript_path(
+            "/tmp/fake-transcript.jsonl",
+            session_id="test-session-id",
+        )
         assert ss._session_ready_event is first_event, (
             "repeat set_transcript_path must not reassign the event"
         )
@@ -8540,6 +8890,7 @@ class TestWakePromptGateMetrics:
         ss._session_ready_event = asyncio.Event()  # closed
         ss._tailer = MagicMock()
         ss._tailer.set_transcript_path = MagicMock()
+        ss._tailer_first_bind_pending = True
 
         wake_turn = _QueuedTurn(
             prompt="WAKE_BODY",
@@ -8550,7 +8901,10 @@ class TestWakePromptGateMetrics:
         deliver_task = asyncio.create_task(ss._deliver_turn(wake_turn))
         # Let the deliver task park in the gate await.
         await asyncio.sleep(0.15)
-        ss.set_transcript_path("/tmp/fake-transcript.jsonl")
+        ss.set_transcript_path(
+            "/tmp/fake-transcript.jsonl",
+            session_id="test-session-id",
+        )
         await asyncio.wait_for(deliver_task, timeout=2.0)
 
         analytics.log_activity.assert_called_once()

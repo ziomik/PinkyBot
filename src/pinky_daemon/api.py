@@ -210,6 +210,7 @@ from pinky_daemon.store_manifest import (
     derive_fleet_store_manifest,
     derive_standalone_tenant_store_manifest_for_agent,
 )
+from pinky_daemon.store_shutdown import StoreShutdownError
 from pinky_daemon.store_snapshot import (
     SnapshotResult,
     StoreSnapshotError,
@@ -1731,9 +1732,11 @@ def create_api(
 
     db_path = os.path.realpath(db_path)
     _data_dir = Path(db_path).parent
-    store_catalog = DaemonStoreCatalog(expected_root=_data_dir)
     store_manifest = _derive_api_store_manifest(db_path)
+    store_catalog = DaemonStoreCatalog(expected_root=_data_dir)
+    store_catalog.configure_manifest(store_manifest)
     storage_observability = StorageObservability(store_manifest)
+    store_catalog.configure_observability(storage_observability)
     try:
         store_catalog.preflight_integrity(
             store_manifest.values(),
@@ -1743,7 +1746,10 @@ def create_api(
         store_catalog.close()
         storage_observability.record_boot_failure()
         raise
-    store_snapshot_service = StoreSnapshotService(store_catalog)
+    store_snapshot_service = StoreSnapshotService(
+        store_catalog,
+        observability=storage_observability,
+    )
 
     app = FastAPI(
         title="Pinky",
@@ -1762,6 +1768,14 @@ def create_api(
     app.state.store_snapshot_service = store_snapshot_service
     app.state.storage_observability = storage_observability
     app.state.ferry_listener = FerryListenerState.from_config(FerryConfig.from_env())
+
+    @app.middleware("http")
+    async def _activate_storage_runtime(request: Request, call_next):
+        # ``create_api`` is still constructor time. The first ASGI request is
+        # the serving boundary for test harnesses that do not run lifespan;
+        # production also enables at startup before background work begins.
+        storage_observability.enable_runtime()
+        return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
     async def _request_validation_response(
@@ -1854,6 +1868,7 @@ def create_api(
             tenant_catalog = StoreCatalog(
                 expected_root=tenant_root,
                 silence_allowlist={},
+                manifest=tenant_manifest,
             )
             observations = tenant_catalog.preflight_integrity(tenant_manifest.values())
             for target in tenant_manifest.values():
@@ -2722,6 +2737,7 @@ def create_api(
         message_context_store=message_context_store,
     )
     _broker_pollers: list = []  # Track active broker pollers
+    from pinky_daemon.pollers import quiesce_delivery_tasks, start_poller
 
     app.state.manager = manager
     app.state.broker = broker
@@ -7574,13 +7590,15 @@ npm run build</pre>
         update = getattr(session, "set_transcript_path", None)
         if callable(update):
             try:
-                update(normalised)
+                accepted = update(normalised, session_id=req.session_id)
             except Exception as e:
                 _log(
                     f"api: transport_transcript_path set_transcript_path "
                     f"raised for {name}: {e}"
                 )
                 raise HTTPException(500, str(e))
+            if accepted is False:
+                raise HTTPException(409, "transcript bind rejected")
         return {"ok": True, "agent": name, "transcript_path": str(normalised)}
 
     @app.post("/agents/{name}/transport/tool-use")
@@ -8676,7 +8694,7 @@ npm run build</pre>
                     adapter, name, broker, registry=agents,
                 )
                 _broker_pollers.append(poller)
-                asyncio.create_task(poller.start())
+                start_poller(poller)
                 _log(f"api: started telegram poller for {name}")
             except Exception as e:
                 _log(f"api: failed to start telegram poller for {name}: {e}")
@@ -8710,7 +8728,7 @@ npm run build</pre>
                     watched_channels=watched,
                 )
                 _broker_pollers.append(poller)
-                asyncio.create_task(poller.start())
+                start_poller(poller)
                 _log(
                     f"api: started discord poller for {name} "
                     f"(poll_interval={poll_interval}s, "
@@ -9490,10 +9508,22 @@ npm run build</pre>
     @app.get("/broker/status")
     async def broker_status():
         """Get message broker status."""
+        now = time.monotonic()
         return {
             "stats": broker.stats,
             "active_pollers": [
-                {"agent": p.agent_name, "polls": p.poll_count, "running": p.is_running}
+                {
+                    "agent": p.agent_name,
+                    "polls": p.poll_count,
+                    "running": p.is_running,
+                    # Watchdog-equipped pollers only (#1145); None elsewhere.
+                    "watchdog_fires": getattr(p, "watchdog_fires", None),
+                    "last_poll_ok_age_s": (
+                        round(now - p.last_poll_ok, 1)
+                        if getattr(p, "last_poll_ok", 0.0)
+                        else None
+                    ),
+                }
                 for p in _broker_pollers
             ],
         }
@@ -11407,6 +11437,26 @@ npm run build</pre>
         states = dream_runner.list_states()
         return {"dream_states": states, "count": len(states)}
 
+    @app.patch("/agents/{agent_name}/dream")
+    async def update_dream_summary(agent_name: str, req: Request):
+        """Edit the dream summary for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        body = await req.json()
+        summary = body.get("summary", "")
+        if not dream_runner.update_summary(agent_name, summary):
+            raise HTTPException(404, "No dream state found for this agent")
+        return {"ok": True}
+
+    @app.delete("/agents/{agent_name}/dream")
+    async def delete_dream_state(agent_name: str):
+        """Delete dream state for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        if not dream_runner.delete_state(agent_name):
+            raise HTTPException(404, "No dream state found for this agent")
+        return {"ok": True}
+
     # ── Agent Context (continuation state) ──────────────────
 
     @app.put("/agents/{agent_name}/context")
@@ -12393,6 +12443,8 @@ npm run build</pre>
         """Start broker pollers, streaming sessions, scheduler, and autonomy."""
         nonlocal shared_mcp_manager
 
+        storage_observability.enable_runtime()
+
         # Lock down SQLite file permissions to owner-only. Runs here (not in
         # create_api) so every store's __init__ has already created its DB
         # file; the sweep is idempotent and best-effort.
@@ -12611,7 +12663,7 @@ npm run build</pre>
                         adapter, agent.name, broker, registry=agents,
                     )
                     _broker_pollers.append(poller)
-                    asyncio.create_task(poller.start())
+                    start_poller(poller)
                     _log(f"startup: broker poller started for {agent.name}")
 
             # Discord poller — REST polling (Gateway/WebSocket is a future v0.2)
@@ -12641,7 +12693,7 @@ npm run build</pre>
                             watched_channels=watched,
                         )
                         _broker_pollers.append(d_poller)
-                        asyncio.create_task(d_poller.start())
+                        start_poller(d_poller)
                         _log(
                             f"startup: discord poller started for {agent.name} "
                             f"(interval={poll_interval}s, "
@@ -12685,7 +12737,7 @@ npm run build</pre>
                                 app_token=app_token,
                             )
                             _broker_pollers.append(s_poller)
-                            asyncio.create_task(s_poller.start())
+                            start_poller(s_poller)
                             _log(f"startup: slack socket-mode poller started for {agent.name}")
                     except Exception as e:
                         _log(f"startup: slack poller failed for {agent.name}: {e}")
@@ -12711,7 +12763,7 @@ npm run build</pre>
                         im_adapter, agent.name, broker,
                     )
                     _broker_pollers.append(im_poller)
-                    asyncio.create_task(im_poller.start())
+                    start_poller(im_poller)
                     _log(f"startup: iMessage poller started for {agent.name}")
                 except Exception as e:
                     _log(f"startup: iMessage poller failed for {agent.name}: {e}")
@@ -12875,6 +12927,7 @@ npm run build</pre>
         if app.state.buzz_poller_tasks:
             await asyncio.gather(*app.state.buzz_poller_tasks, return_exceptions=True)
         app.state.buzz_poller_tasks.clear()
+        await quiesce_delivery_tasks()
         await autonomy.stop()
         await scheduler.stop()
         await watchdog.stop()
@@ -12882,10 +12935,19 @@ npm run build</pre>
         if shared_mcp_manager and shared_mcp_manager.is_running:
             await shared_mcp_manager.stop()
             _log("shutdown: shared MCP server stopped")
-        message_context_store.close()
         for tenant_catalog in tenant_store_catalogs.values():
             tenant_catalog.close()
-        store_catalog.close()
+        try:
+            report = store_catalog.shutdown(deadline_seconds=10.0)
+        except StoreShutdownError as exc:
+            app.state.store_shutdown_report = exc.report
+            _log(f"ERROR shutdown: {exc}")
+            raise
+        app.state.store_shutdown_report = report
+        _log(
+            "shutdown: store finalization complete "
+            f"attempted={len(report.attempted)} finalized={len(report.finalized)}"
+        )
 
     # ── Admin: Session Watchdog ─────────────────────────
 
@@ -14298,5 +14360,6 @@ npm run build</pre>
         _log(f"ERROR startup: store catalog validation failed: {exc}")
         raise
     storage_observability.record_boot_success(store_catalog.snapshot(), warnings)
+    storage_observability.arm_runtime()
 
     return app

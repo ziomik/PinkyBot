@@ -12,9 +12,12 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 from pinky_daemon.store_catalog import StoreCatalog, StoreRecord
+
+if TYPE_CHECKING:
+    from pinky_daemon.storage_observability import StorageObservability
 
 BACKUP_PAGES = 64
 BACKUP_SLEEP_SECONDS = 0.01
@@ -86,8 +89,14 @@ class _SelectedStore:
 class StoreSnapshotService:
     """Produce verified copies without exposing live database files to callers."""
 
-    def __init__(self, catalog: StoreCatalog) -> None:
+    def __init__(
+        self,
+        catalog: StoreCatalog,
+        *,
+        observability: StorageObservability | None = None,
+    ) -> None:
         self._catalog = catalog
+        self._observability = observability
 
     def create_snapshots(
         self,
@@ -95,7 +104,7 @@ class StoreSnapshotService:
         *,
         on_outcome: Callable[[SnapshotResult], None] | None = None,
     ) -> list[SnapshotResult]:
-        """Snapshot one named store or every authoritative filesystem store.
+        """Snapshot one named store or every snapshot-recovery filesystem store.
 
         The global lock serializes backup work across all service instances. A
         single catalog snapshot is selected and grouped before any source is
@@ -181,7 +190,7 @@ class StoreSnapshotService:
             requested = [
                 record
                 for record in records
-                if record.criticality == "authoritative" and not record.is_memory
+                if record.recovery == "snapshot" and not record.is_memory
             ]
             selected_paths = {record.resolved_path for record in requested}
 
@@ -265,7 +274,12 @@ class StoreSnapshotService:
 
         try:
             try:
-                self._backup_and_verify(store.resolved_path, temp_path, source_identity)
+                self._backup_and_verify(
+                    store.resolved_path,
+                    temp_path,
+                    source_identity,
+                    store.logical_names,
+                )
             except (FileNotFoundError, sqlite3.OperationalError):
                 if not os.path.exists(store.resolved_path):
                     return SnapshotResult(
@@ -300,6 +314,7 @@ class StoreSnapshotService:
         source_path: str,
         destination_path: Path,
         expected_identity: tuple[int, int],
+        logical_names: tuple[str, ...] = (),
     ) -> None:
         source: sqlite3.Connection | None = None
         destination: sqlite3.Connection | None = None
@@ -322,8 +337,15 @@ class StoreSnapshotService:
                 sleep=BACKUP_SLEEP_SECONDS,
             )
             self._assert_source_identity(source_path, expected_identity)
-            check_rows = destination.execute("PRAGMA quick_check").fetchall()
+            try:
+                check_rows = destination.execute("PRAGMA quick_check").fetchall()
+            except sqlite3.Error:
+                if self._observability is not None:
+                    self._observability.record_snapshot_quick_check_failure(logical_names)
+                raise
             if check_rows != [("ok",)]:
+                if self._observability is not None:
+                    self._observability.record_snapshot_quick_check_failure(logical_names)
                 raise StoreSnapshotVerificationError(f"snapshot quick_check failed: {check_rows!r}")
         finally:
             if destination is not None:

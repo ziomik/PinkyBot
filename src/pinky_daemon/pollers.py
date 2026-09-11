@@ -12,6 +12,7 @@ import re
 import sys
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -59,6 +60,7 @@ _PRIME_FRESH_WINDOW_SECONDS = 30.0
 # weak references, so a bare fire-and-forget create_task can be garbage
 # collected mid-flight and its exception silently dropped.
 _DELIVERY_TASKS: set["asyncio.Task"] = set()
+_POLLER_TASKS: set["asyncio.Task"] = set()
 
 
 def _deliver_in_background(coro, log_prefix: str) -> "asyncio.Task":
@@ -77,12 +79,195 @@ def _deliver_in_background(coro, log_prefix: str) -> "asyncio.Task":
     task.add_done_callback(_on_done)
     return task
 
+
+def start_poller(poller) -> "asyncio.Task":
+    """Start and retain one poller loop until its admitted batch has drained."""
+    task = asyncio.create_task(poller.start())
+    _POLLER_TASKS.add(task)
+
+    def _on_done(done: "asyncio.Task") -> None:
+        _POLLER_TASKS.discard(done)
+        if done.cancelled():
+            return
+        exc = done.exception()
+        if exc is not None:
+            _log(f"{type(poller).__name__}: poller task failed: {exc!r}")
+
+    task.add_done_callback(_on_done)
+    return task
+
+
+async def _sleep_until_stopped(stop_event: asyncio.Event, delay: float) -> None:
+    """Sleep between polls, returning immediately when stop closes ingress."""
+    if stop_event.is_set():
+        return
+    if delay <= 0:
+        await asyncio.sleep(0)
+        return
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=delay)
+    except TimeoutError:
+        pass
+
+
+async def quiesce_delivery_tasks() -> None:
+    """Wait until poller loops and every admitted delivery stop writing."""
+    while _POLLER_TASKS or _DELIVERY_TASKS:
+        tasks = tuple(_POLLER_TASKS | _DELIVERY_TASKS)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        _POLLER_TASKS.difference_update(tasks)
+        _DELIVERY_TASKS.difference_update(tasks)
+
 if TYPE_CHECKING:
     from pinky_outreach.slack import SlackAdapter
     from pinky_outreach.types import Chat
 
 
-class TelegramPoller:
+# Seconds past poll_timeout before a poll is declared stuck. Telegram's server
+# always answers a getUpdates long poll within poll_timeout, so anything this
+# far past it means the connection is dead and the read will never return.
+_POLL_WATCHDOG_GRACE = 30.0
+
+
+class _TelegramPollWatchdog:
+    """Deadline + recovery for blocking getUpdates calls (#1145).
+
+    The 2026-08-23 incident: a network blip left every Telegram poller's
+    long-poll blocked in ssl.read indefinitely — the httpx client-level read
+    timeout demonstrably did not fire — and because polls ran on the event
+    loop's DEFAULT executor, the stuck threads consumed most of that shared
+    pool and starved unrelated daemon work. Three structural changes:
+
+      * every poller owns a DEDICATED single-thread executor, so a stuck
+        poll can never starve anything beyond its own poller;
+      * each poll runs under an outer asyncio deadline that does not depend
+        on the HTTP stack honoring its own timeouts;
+      * on deadline the adapter's HTTP client is recycled (closing its pooled
+        sockets frees the stuck thread) and the executor is replaced, so
+        polling continues even if the old thread never exits.
+
+    Host classes must define ``_poll_timeout``, ``_adapter`` (with
+    ``get_updates``/``recycle``) and ``_process_messages`` before calling
+    ``_init_watchdog``.
+
+    Tradeoffs, deliberately accepted: a thread the recycle cannot free (e.g.
+    wedged in DNS resolution before any pooled socket exists) accumulates
+    one non-daemon thread per fire — observable via ``watchdog_fires`` and
+    the loud log — and any still-stuck thread is joined at interpreter exit,
+    so a truly immortal one can hang daemon shutdown until the supervisor
+    kills the process. Both beat the alternative this replaces (silent
+    fleet-wide inbound death).
+    """
+
+    def _init_watchdog(self, label: str, grace: float) -> None:
+        self._watchdog_label = label
+        self._watchdog_grace = grace
+        self._poll_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=label
+        )
+        self._watchdog_fires = 0
+        self._last_poll_ok = 0.0
+        self._active_poll = None
+
+    async def _watched_poll(self, poll_fn):
+        """Run ``poll_fn`` on the dedicated executor under a hard deadline.
+
+        Returns the poll result, or ``[]`` after firing the watchdog — the
+        recovery is loud (log + counter) so the empty result never masks it.
+
+        A poll that completes AT or AFTER the deadline is never discarded:
+        its ``get_updates`` already advanced the offset, so the next poll
+        would confirm-and-drop those updates server-side — dropping the
+        result here would be silent, permanent message loss. Completed-at-
+        the-edge results are returned directly; genuinely late completions
+        are delivered through ``_process_messages`` when they arrive.
+        """
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(self._poll_executor, poll_fn)
+        self._active_poll = fut
+        deadline = self._poll_timeout + self._watchdog_grace
+        try:
+            try:
+                result = await asyncio.wait_for(asyncio.shield(fut), timeout=deadline)
+            except TimeoutError:
+                if fut.done() and not fut.cancelled() and fut.exception() is None:
+                    # Completed on the deadline edge (loop scheduled the timeout
+                    # callback first) — a healthy poll, not a stuck one.
+                    self._last_poll_ok = time.monotonic()
+                    return fut.result()
+                fut.add_done_callback(self._on_abandoned_poll_done)
+                self._recycle_after_stuck_poll(deadline)
+                return []
+        finally:
+            if self._active_poll is fut:
+                self._active_poll = None
+        self._last_poll_ok = time.monotonic()
+        return result
+
+    def _on_abandoned_poll_done(self, fut) -> None:
+        """An abandoned poll eventually finished (usually because the recycle
+        closed its socket). Consume the error quietly; deliver a late RESULT
+        — its updates are already offset-confirmed and exist nowhere else."""
+        if fut.cancelled():
+            return
+        if fut.exception() is not None:  # consumed: no "never retrieved" noise
+            return
+        late = fut.result()
+        if not late:
+            return
+        if not self._accepting_deliveries:
+            _log(
+                f"{self._watchdog_label}: abandoned poll completed after stop; "
+                f"platform=telegram dropping {len(late)} update(s)"
+            )
+            return
+        _log(
+            f"{self._watchdog_label}: abandoned poll completed late with "
+            f"{len(late)} update(s) — delivering (offset already advanced)"
+        )
+        _deliver_in_background(
+            self._process_messages(late),
+            f"{self._watchdog_label} late-delivery",
+        )
+
+    def _recycle_after_stuck_poll(self, deadline: float) -> None:
+        self._watchdog_fires += 1
+        age = time.monotonic() - self._last_poll_ok if self._last_poll_ok else -1.0
+        _log(
+            f"{self._watchdog_label}: WATCHDOG poll exceeded {deadline:.0f}s hard "
+            f"deadline (fire #{self._watchdog_fires}, last successful poll "
+            f"{age:.0f}s ago) — recycling HTTP client + poll thread"
+        )
+        try:
+            self._adapter.recycle()
+        except Exception as e:
+            _log(f"{self._watchdog_label}: adapter recycle failed: {e}")
+        old = self._poll_executor
+        self._poll_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=self._watchdog_label
+        )
+        old.shutdown(wait=False)
+
+    def _shutdown_watchdog(self) -> None:
+        active = self._active_poll
+        if active is not None and not active.done():
+            try:
+                self._adapter.recycle()
+            except Exception as e:
+                _log(f"{self._watchdog_label}: stop-time adapter recycle failed: {e}")
+        self._poll_executor.shutdown(wait=False)
+
+    @property
+    def watchdog_fires(self) -> int:
+        return self._watchdog_fires
+
+    @property
+    def last_poll_ok(self) -> float:
+        """monotonic timestamp of the last completed poll (0.0 = never)."""
+        return self._last_poll_ok
+
+
+class TelegramPoller(_TelegramPollWatchdog):
     """Polls Telegram Bot API for new messages.
 
     Uses long polling (getUpdates) to receive messages in near-realtime.
@@ -98,6 +283,7 @@ class TelegramPoller:
         poll_interval: float = 1.0,
         allowed_chat_ids: list[str] | None = None,
         event_callback=None,
+        watchdog_grace: float = _POLL_WATCHDOG_GRACE,
     ) -> None:
         self._adapter = adapter
         self._handler = handler
@@ -106,19 +292,33 @@ class TelegramPoller:
         self._allowed_chats = set(allowed_chat_ids) if allowed_chat_ids else None
         self._event_callback = event_callback  # async fn(platform, chat_id, sender, content)
         self._running = False
+        self._stop_requested = False
+        self._accepting_deliveries = True
+        self._stop_event = asyncio.Event()
         self._poll_count = 0
+        self._init_watchdog("telegram-poller", watchdog_grace)
 
     async def start(self) -> None:
         """Start the polling loop."""
+        if self._stop_requested:
+            _log("telegram-poller: start suppressed after stop")
+            return
         self._running = True
+        self._accepting_deliveries = True
+        self._stop_event.clear()
         _log("telegram-poller: starting")
 
-        # Verify bot connection
+        # Verify bot connection — on the poller's executor, under a deadline,
+        # so a wedged network can't block the event loop or hang startup.
+        loop = asyncio.get_running_loop()
         try:
-            me = self._adapter.get_me()
+            me = await asyncio.wait_for(
+                loop.run_in_executor(self._poll_executor, self._adapter.get_me),
+                timeout=30,
+            )
             _log(f"telegram-poller: connected as @{me.get('username', '?')}")
-        except TelegramError as e:
-            _log(f"telegram-poller: failed to connect: {e}")
+        except (TelegramError, TimeoutError) as e:
+            _log(f"telegram-poller: failed to connect: {e!r}")
             return
 
         while self._running:
@@ -126,23 +326,30 @@ class TelegramPoller:
                 await self._poll_once()
             except TelegramError as e:
                 _log(f"telegram-poller: error: {e}")
-                await asyncio.sleep(5)  # Back off on error
+                await _sleep_until_stopped(self._stop_event, 5)
             except Exception as e:
                 _log(f"telegram-poller: unexpected error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
 
-            await asyncio.sleep(self._poll_interval)
+            await _sleep_until_stopped(self._stop_event, self._poll_interval)
 
     async def _poll_once(self) -> None:
         """Single poll iteration."""
-        # Run blocking HTTP call in thread pool
-        messages = await asyncio.get_running_loop().run_in_executor(
-            None,
+        # Blocking HTTP call on the poller's OWN executor, under a hard
+        # deadline (#1145) — never the loop default pool.
+        messages = await self._watched_poll(
             lambda: self._adapter.get_updates(timeout=self._poll_timeout),
         )
 
         self._poll_count += 1
 
+        if not self._accepting_deliveries:
+            return
+        await self._process_messages(messages)
+
+    async def _process_messages(self, messages) -> None:
+        """Route polled updates to the handler — also the watchdog's
+        late-delivery path for polls that complete after abandonment."""
         for msg in messages:
             # Filter by allowed chats
             if self._allowed_chats and msg.chat_id not in self._allowed_chats:
@@ -185,7 +392,11 @@ class TelegramPoller:
 
     def stop(self) -> None:
         """Stop the polling loop."""
+        self._stop_requested = True
         self._running = False
+        self._accepting_deliveries = False
+        self._stop_event.set()
+        self._shutdown_watchdog()
         _log("telegram-poller: stopping")
 
     @property
@@ -197,7 +408,7 @@ class TelegramPoller:
         return self._running
 
 
-class BrokerTelegramPoller:
+class BrokerTelegramPoller(_TelegramPollWatchdog):
     """Polls Telegram for a specific agent's bot token, routes through MessageBroker.
 
     Unlike TelegramPoller which uses a single handler, this poller:
@@ -216,6 +427,7 @@ class BrokerTelegramPoller:
         poll_timeout: int = 30,
         poll_interval: float = 1.0,
         event_callback=None,
+        watchdog_grace: float = _POLL_WATCHDOG_GRACE,
     ) -> None:
         from pinky_daemon.broker import BrokerMessage, MessageBroker
         self._BrokerMessage = BrokerMessage
@@ -228,20 +440,35 @@ class BrokerTelegramPoller:
         self._poll_interval = poll_interval
         self._event_callback = event_callback
         self._running = False
+        self._stop_requested = False
+        self._accepting_deliveries = True
+        self._stop_event = asyncio.Event()
         self._poll_count = 0
         self._bot_username = ""
+        self._init_watchdog(f"broker-poller[{agent_name}]", watchdog_grace)
 
     async def start(self) -> None:
         """Start the polling loop."""
+        if self._stop_requested:
+            _log(f"broker-poller[{self._agent_name}]: start suppressed after stop")
+            return
         self._running = True
+        self._accepting_deliveries = True
+        self._stop_event.clear()
         _log(f"broker-poller[{self._agent_name}]: starting")
 
+        # On the poller's executor, under a deadline — a wedged network can't
+        # block the event loop or hang startup.
+        loop = asyncio.get_running_loop()
         try:
-            me = self._adapter.get_me()
+            me = await asyncio.wait_for(
+                loop.run_in_executor(self._poll_executor, self._adapter.get_me),
+                timeout=30,
+            )
             self._bot_username = me.get("username", "?")
             _log(f"broker-poller[{self._agent_name}]: connected as @{self._bot_username}")
-        except TelegramError as e:
-            _log(f"broker-poller[{self._agent_name}]: failed to connect: {e}")
+        except (TelegramError, TimeoutError) as e:
+            _log(f"broker-poller[{self._agent_name}]: failed to connect: {e!r}")
             return
 
         while self._running:
@@ -249,22 +476,30 @@ class BrokerTelegramPoller:
                 await self._poll_once()
             except TelegramError as e:
                 _log(f"broker-poller[{self._agent_name}]: error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
             except Exception as e:
                 _log(f"broker-poller[{self._agent_name}]: unexpected error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
 
-            await asyncio.sleep(self._poll_interval)
+            await _sleep_until_stopped(self._stop_event, self._poll_interval)
 
     async def _poll_once(self) -> None:
         """Single poll iteration — routes messages through broker."""
-        messages = await asyncio.get_running_loop().run_in_executor(
-            None,
+        # Blocking HTTP call on the poller's OWN executor, under a hard
+        # deadline (#1145) — never the loop default pool.
+        messages = await self._watched_poll(
             lambda: self._adapter.get_updates(timeout=self._poll_timeout),
         )
 
         self._poll_count += 1
 
+        if not self._accepting_deliveries:
+            return
+        await self._process_messages(messages)
+
+    async def _process_messages(self, messages) -> None:
+        """Route polled updates through the broker — also the watchdog's
+        late-delivery path for polls that complete after abandonment."""
         for msg in messages:
             chat_type = msg.metadata.get("chat_type", "")
             is_group = chat_type in ("group", "supergroup")
@@ -322,7 +557,11 @@ class BrokerTelegramPoller:
 
     def stop(self) -> None:
         """Stop the polling loop."""
+        self._stop_requested = True
         self._running = False
+        self._accepting_deliveries = False
+        self._stop_event.set()
+        self._shutdown_watchdog()
         _log(f"broker-poller[{self._agent_name}]: stopping")
 
     @property
@@ -363,11 +602,19 @@ class BrokeriMessagePoller:
         self._poll_interval = poll_interval
         self._event_callback = event_callback
         self._running = False
+        self._stop_requested = False
+        self._accepting_deliveries = True
+        self._stop_event = asyncio.Event()
         self._poll_count = 0
 
     async def start(self) -> None:
         """Start the polling loop."""
+        if self._stop_requested:
+            _log(f"imessage-poller[{self._agent_name}]: start suppressed after stop")
+            return
         self._running = True
+        self._accepting_deliveries = True
+        self._stop_event.clear()
         _log(f"imessage-poller[{self._agent_name}]: starting")
 
         if not self._adapter.can_receive:
@@ -378,7 +625,7 @@ class BrokeriMessagePoller:
             _log(f"imessage-poller[{self._agent_name}]: send-only mode (no inbound)")
             # Don't return — keep running so outbound still works
             while self._running:
-                await asyncio.sleep(self._poll_interval)
+                await _sleep_until_stopped(self._stop_event, self._poll_interval)
             return
 
         _log(f"imessage-poller[{self._agent_name}]: chat.db connected, polling")
@@ -388,9 +635,9 @@ class BrokeriMessagePoller:
                 await self._poll_once()
             except Exception as e:
                 _log(f"imessage-poller[{self._agent_name}]: error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
 
-            await asyncio.sleep(self._poll_interval)
+            await _sleep_until_stopped(self._stop_event, self._poll_interval)
 
     async def _poll_once(self) -> None:
         """Single poll iteration."""
@@ -406,6 +653,8 @@ class BrokeriMessagePoller:
 
         self._poll_count += 1
 
+        if not self._accepting_deliveries:
+            return
         for msg in messages:
             is_group = msg.metadata.get("is_group", False)
 
@@ -444,7 +693,10 @@ class BrokeriMessagePoller:
                     _log(f"imessage-poller[{self._agent_name}]: event callback error: {e}")
 
     def stop(self) -> None:
+        self._stop_requested = True
         self._running = False
+        self._accepting_deliveries = False
+        self._stop_event.set()
         _log(f"imessage-poller[{self._agent_name}]: stopping")
 
     @property
@@ -505,6 +757,9 @@ class BrokerDiscordPoller:
         self._configured_channels = list(watched_channels or [])
         self._event_callback = event_callback
         self._running = False
+        self._stop_requested = False
+        self._accepting_deliveries = True
+        self._stop_event = asyncio.Event()
         self._poll_count = 0
         self._bot_user_id = ""
         self._bot_username = ""
@@ -535,7 +790,12 @@ class BrokerDiscordPoller:
 
     async def start(self) -> None:
         """Start the polling loop."""
+        if self._stop_requested:
+            _log(f"discord-poller[{self._agent_name}]: start suppressed after stop")
+            return
         self._running = True
+        self._accepting_deliveries = True
+        self._stop_event.clear()
         _log(f"discord-poller[{self._agent_name}]: starting")
 
         # Verify bot connection
@@ -571,15 +831,18 @@ class BrokerDiscordPoller:
                     f"discord-poller[{self._agent_name}]: rate limited, "
                     f"sleeping {e.retry_after:.2f}s"
                 )
-                await asyncio.sleep(min(e.retry_after, 30.0))
+                await _sleep_until_stopped(
+                    self._stop_event,
+                    min(e.retry_after, 30.0),
+                )
             except DiscordError as e:
                 _log(f"discord-poller[{self._agent_name}]: error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
             except Exception as e:
                 _log(f"discord-poller[{self._agent_name}]: unexpected error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
 
-            await asyncio.sleep(self._poll_interval)
+            await _sleep_until_stopped(self._stop_event, self._poll_interval)
 
     async def _refresh_channels(self, *, verbose: bool) -> None:
         """Refresh the watched-channel set and prime last_id for newcomers.
@@ -737,6 +1000,8 @@ class BrokerDiscordPoller:
                 )
                 continue
 
+            if not self._accepting_deliveries:
+                return
             if not messages:
                 continue
 
@@ -749,10 +1014,14 @@ class BrokerDiscordPoller:
             # renames are rare). Resolve once per channel per sweep instead
             # of fanning out N get_channel calls in the per-message loop.
             chat_info = await self._resolve_channel_info(channel_id)
+            if not self._accepting_deliveries:
+                return
             chat_title = chat_info.title if chat_info and chat_info.title else ""
             is_group = bool(chat_info and chat_info.chat_type != "dm")
 
             for msg in messages:
+                if not self._accepting_deliveries:
+                    return
                 # Track high-water mark even for skipped messages so we don't
                 # re-fetch them next tick.
                 self._last_id[channel_id] = msg.message_id
@@ -812,7 +1081,10 @@ class BrokerDiscordPoller:
 
     def stop(self) -> None:
         """Stop the polling loop."""
+        self._stop_requested = True
         self._running = False
+        self._accepting_deliveries = False
+        self._stop_event.set()
         _log(f"discord-poller[{self._agent_name}]: stopping")
 
 
@@ -919,6 +1191,8 @@ class BrokerSlackPoller:
         self._app_token = app_token
         self._event_callback = event_callback
         self._running = False
+        self._stop_requested = False
+        self._accepting_deliveries = True
         self._bot_user_id = ""
         self._bot_id = ""  # our own bot_id (from auth.test) — filters our bot_message echoes
         self._client = None  # slack_sdk SocketModeClient, created in start()
@@ -946,6 +1220,9 @@ class BrokerSlackPoller:
         background tasks, then returns — the connection stays alive as long as
         this poller (and thus ``self._client``) is referenced by the daemon.
         """
+        if self._stop_requested:
+            _log(f"slack-poller[{self._agent_name}]: start suppressed after stop")
+            return
         if self._running:
             _log(f"slack-poller[{self._agent_name}]: already running, ignoring start()")
             return
@@ -970,6 +1247,9 @@ class BrokerSlackPoller:
         except Exception as e:
             _log(f"slack-poller[{self._agent_name}]: auth.test failed: {e}")
             return
+        if self._stop_requested:
+            _log(f"slack-poller[{self._agent_name}]: startup stopped before connect")
+            return
         self._bot_user_id = info.get("user_id", "") or ""
         if not self._bot_user_id:
             # Fail closed: without our own user id the self-filter is disarmed
@@ -992,6 +1272,18 @@ class BrokerSlackPoller:
         )
         self._client = client
 
+        async def _run_admitted_request(req_type: str, payload: dict) -> None:
+            try:
+                if req_type == "interactive":
+                    await self._handle_interactive(payload, _admitted=True)
+                else:
+                    await self._handle_event(payload, _admitted=True)
+            except Exception as e:
+                _log(
+                    f"slack-poller[{self._agent_name}]: handle_{req_type} "
+                    f"error: {e!r}"
+                )
+
         async def _on_request(smc, req) -> None:
             # ACK FIRST — every Socket Mode request envelope (events_api,
             # slash_commands, interactive, …) carries an envelope_id and must be
@@ -1005,15 +1297,25 @@ class BrokerSlackPoller:
                     )
                 except Exception as e:
                     _log(f"slack-poller[{self._agent_name}]: ack failed: {e}")
-            # Interactive envelopes (block_actions button clicks) carry the
-            # purchase Approve/Reject buttons (#249). Handle them here; every
-            # other non-events_api envelope is dropped (already acked) so Slack
-            # doesn't keep retrying.
-            if req.type == "interactive":
-                try:
-                    await self._handle_interactive(req.payload or {})
-                except Exception as e:
-                    _log(f"slack-poller[{self._agent_name}]: handle_interactive error: {e!r}")
+            # After the prompt ACK, atomically fence or transfer the whole
+            # request into the delivery-task set. slack_sdk does not retain its
+            # own listener tasks, so this tracked child is the publication
+            # barrier for both message and interactive paths.
+            if req.type in ("interactive", "events_api"):
+                if not self._accepting_deliveries:
+                    _log(
+                        f"slack-poller[{self._agent_name}]: dropping {req.type} "
+                        "envelope after stop"
+                    )
+                    return
+                admitted = _deliver_in_background(
+                    _run_admitted_request(req.type, req.payload or {}),
+                    f"slack-poller[{self._agent_name}] {req.type} listener",
+                )
+                # Preserve the listener's existing completion contract for
+                # callers while shielding the retained child from SDK task
+                # cancellation during close(). The ACK already completed.
+                await asyncio.shield(admitted)
                 return
             # Only message events are wired up for #224; other (already-acked)
             # envelope types are dropped so Slack doesn't keep retrying them.
@@ -1024,22 +1326,25 @@ class BrokerSlackPoller:
                         f"envelope ({req.type})"
                     )
                 return
-            try:
-                await self._handle_event(req.payload or {})
-            except Exception as e:
-                _log(f"slack-poller[{self._agent_name}]: handle_event error: {e!r}")
 
         client.socket_mode_request_listeners.append(_on_request)
 
         self._running = True
+        self._accepting_deliveries = True
         try:
             await client.connect()
-            _log(f"slack-poller[{self._agent_name}]: socket mode connected, listening")
+            if not self._stop_requested:
+                _log(f"slack-poller[{self._agent_name}]: socket mode connected, listening")
         except Exception as e:
             _log(f"slack-poller[{self._agent_name}]: connect failed: {e}")
             self._running = False
 
-    async def _handle_interactive(self, payload: dict) -> None:
+    async def _handle_interactive(
+        self,
+        payload: dict,
+        *,
+        _admitted: bool = False,
+    ) -> None:
         """Handle a Slack interactive (block_actions) envelope — purchase buttons (#249).
 
         SECURITY (financial boundary): the approver identity is taken from
@@ -1049,6 +1354,9 @@ class BrokerSlackPoller:
         here and never reach the agent. The agent is told to act ONLY after this
         gate passes, so the LLM is not the security boundary.
         """
+        if not _admitted and not self._accepting_deliveries:
+            _log(f"slack-poller[{self._agent_name}]: dropping interactive after stop")
+            return
         if (payload or {}).get("type") != "block_actions":
             return
         actions = payload.get("actions") or []
@@ -1319,7 +1627,15 @@ class BrokerSlackPoller:
             channel_namer=self._resolve_channel_title,
         )
 
-    async def _handle_event(self, payload: dict) -> None:
+    async def _handle_event(
+        self,
+        payload: dict,
+        *,
+        _admitted: bool = False,
+    ) -> None:
+        if not _admitted and not self._accepting_deliveries:
+            _log(f"slack-poller[{self._agent_name}]: dropping events_api after stop")
+            return
         event = (payload or {}).get("event") or {}
         if event.get("type") != "message":
             return
@@ -1367,6 +1683,13 @@ class BrokerSlackPoller:
                 sender_name = resolved
         chat_title = await self._resolve_channel_title(channel)
         text = await self._resolve_text_refs(text)
+
+        if not _admitted and not self._accepting_deliveries:
+            _log(
+                f"slack-poller[{self._agent_name}]: dropping message after stop "
+                "before broker publication"
+            )
+            return
 
         attachments = [
             {
@@ -1431,7 +1754,9 @@ class BrokerSlackPoller:
         task is strongly referenced (not GC'd mid-flight) and any close error is
         logged rather than silently dropped.
         """
+        self._stop_requested = True
         self._running = False
+        self._accepting_deliveries = False
         _log(f"slack-poller[{self._agent_name}]: stopping")
         client = self._client
         if client is not None:

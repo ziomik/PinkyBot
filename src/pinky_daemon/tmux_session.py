@@ -510,6 +510,16 @@ _PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
 # SessionStart hook latency (sub-second to ~200ms).
 _FIRST_BIND_RECOVERY_DELAY_SEC = 5.0
 
+# #1148 — this per-session marker gates daemon-spawned headless sessions because
+# the daemon environment never carries it. Pane-descendant processes inherit
+# the marker; the session-lineage guard is the backstop for their binds.
+_TMUX_TRANSCRIPT_BIND_MARKER_ENV = "PINKY_TMUX_TRANSCRIPT_BIND"
+_TMUX_TRANSCRIPT_BIND_MARKER_VALUE = "1"
+
+# Stable incident signature for api.log greps. Keep the prefix unchanged even
+# if the structured fields below evolve.
+_TRANSCRIPT_BIND_REJECTED_LOG_PREFIX = "TRANSCRIPT_BIND_REJECTED"
+
 
 class _ContextLockDeferral(Exception):  # noqa: N818
     """Transient: context-lock file present at paste time.
@@ -1362,6 +1372,7 @@ class _TranscriptOccurrenceTicket:
 
 
 _TranscriptSourceKey = tuple[int, int]
+_FoldPairKey = tuple[_TranscriptSourceKey | None, str]
 _TranscriptCandidateSource = tuple[
     _TranscriptSourceKey,
     int,
@@ -1469,7 +1480,59 @@ class _QueuedPromptEvidence:
 
     content: str | None
     turn: _QueuedTurn | None
+    occurrence_id: int
     retired: bool = False
+    entry_offset: int | None = None
+    source_identity: tuple[int, int] | None = None
+    ticket_offset: int | None = None
+    ticket_identity: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class _QueuedCommandAttachmentEvidence:
+    """One queued-command attachment awaiting its matching remove."""
+
+    prompt: str
+    occurrence_id: int | None
+    entry_offset: int | None
+    source_identity: tuple[int, int] | None
+
+
+@dataclass(frozen=True)
+class _RemovedPromptEvidence:
+    """One matched native remove awaiting its queued-command attachment."""
+
+    queued: _QueuedPromptEvidence
+    entry_offset: int | None
+    source_identity: tuple[int, int] | None
+
+
+@dataclass(frozen=True)
+class _TranscriptProbeRow:
+    """One complete JSONL row retained inside the phantom scan budget."""
+
+    offset: int
+    end: int
+    raw: bytes
+
+
+@dataclass(frozen=True)
+class _TranscriptProbeFoldChain:
+    """One exact enqueue/remove/queued-command occurrence from a scan."""
+
+    prompt: str
+    enqueue: _TranscriptProbeRow
+    remove: _TranscriptProbeRow
+    attachment: _TranscriptProbeRow
+
+
+@dataclass
+class _TranscriptProbeFoldOccurrence:
+    """One enqueue-created occurrence while reconstructing fold history."""
+
+    prompt: str
+    enqueue: _TranscriptProbeRow
+    attachment: _TranscriptProbeRow | None = None
 
 
 @dataclass(frozen=True)
@@ -1827,6 +1890,13 @@ def _inflight_replay_tail_cap() -> int:
 # per opened physical file, not per candidate/path alias.
 _PHANTOM_TRANSCRIPT_SCAN_BYTES = 4 * 1024 * 1024
 
+# Live attachment/remove pairing may span many minutes, so it is occurrence-
+# bounded rather than time-windowed. Each side owns both caps independently;
+# oldest eviction is fail-closed and logged with enough detail to diagnose a
+# later replay whose certification evidence was starved.
+_FOLD_PAIR_MAX_OCCURRENCES = 1024
+_FOLD_PAIR_MAX_PROMPT_BYTES = 4 * 1024 * 1024
+
 # Exact bytes immediately below the pre-paste EOF distinguish a stable append
 # epoch from copy-truncate/regrow on the same inode. The anchor is deliberately
 # small because it is captured on every pane delivery.
@@ -1959,6 +2029,14 @@ class TmuxSession(TransportReplacementMixin):
         self._scheduler_pending_turns: list[_QueuedTurn] = []
         self._pane_queue_operations: deque[_QueuedPromptEvidence] = deque()
         self._pane_dequeued_turns: deque[_DequeuedPromptEvidence] = deque()
+        self._pane_fold_attachments: deque[_QueuedCommandAttachmentEvidence] = deque()
+        self._pane_fold_removes: deque[_RemovedPromptEvidence] = deque()
+        self._pane_fold_attachment_bytes = 0
+        self._pane_fold_remove_bytes = 0
+        self._pane_fold_next_occurrence_id = 0
+        self._pane_fold_ambiguous_keys: set[_FoldPairKey] = set()
+        self._pane_fold_ambiguous_bytes = 0
+        self._pane_fold_certification_disabled = False
         # Dashboard terminal requests start immediately and may arrive out of
         # order. Serialize pane input and remember each client's acknowledged
         # sequence so cumulative retries never duplicate text or Enter.
@@ -1986,6 +2064,7 @@ class TmuxSession(TransportReplacementMixin):
             "errors": 0,
             "reconnects": 0,
             "auto_restarts": 0,
+            "transcript_bind_rejections": 0,
         }
         self.usage = SessionUsage()
 
@@ -2092,6 +2171,10 @@ class TmuxSession(TransportReplacementMixin):
         # genuinely new head (deque advanced) auto-starts a fresh ceiling budget
         # without having to touch the out-of-loop head-start sites.
         self._inflight_pane_ext_anchor: tuple[object, float] | None = None
+        # (#1156) One watchdog-tick grace for transcript proof that lags the
+        # busy→idle boundary. Keyed by the deque head's identity so advancing
+        # to a genuinely new turn grants that turn its own bounded recheck.
+        self._inflight_idle_grace_head: object | None = None
         # #984 Defect 2 — continuous frozen-live-status observation.  One
         # bounded tuple per TmuxSession: (last_updated value, first-seen wall
         # clock, consecutive observations).  Any changed value starts a new
@@ -2153,6 +2236,12 @@ class TmuxSession(TransportReplacementMixin):
         # ``stop_hook_summary``. Continue launches preserve the
         # seek-to-EOF default (#496 round-1 Case 3 reply-spam defense).
         self._tailer_first_bind_pending: bool = False
+
+        # #1148 — lineage reported by the pane's SessionStart hook. A new
+        # non-empty id may replace this only while the daemon's per-spawn
+        # first-bind window above is open. Retain it across relaunches; a
+        # legitimate daemon relaunch re-arms the window in ``_start_tailer``.
+        self._bound_transcript_session_id: str = ""
 
         # Issue #565 — handle to the delayed first-bind recovery task
         # scheduled from ``_start_tailer``. Cancelled in ``_stop_tailer``
@@ -4237,6 +4326,7 @@ class TmuxSession(TransportReplacementMixin):
             env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
+        env[_TMUX_TRANSCRIPT_BIND_MARKER_ENV] = _TMUX_TRANSCRIPT_BIND_MARKER_VALUE
         env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] = str(
             DEFAULT_MAX_CONCURRENT_SUBAGENTS
         )
@@ -4406,6 +4496,14 @@ class TmuxSession(TransportReplacementMixin):
             )
         self._pane_queue_operations.clear()
         self._pane_dequeued_turns.clear()
+        self._pane_fold_attachments.clear()
+        self._pane_fold_removes.clear()
+        self._pane_fold_attachment_bytes = 0
+        self._pane_fold_remove_bytes = 0
+        self._pane_fold_next_occurrence_id = 0
+        self._pane_fold_ambiguous_keys.clear()
+        self._pane_fold_ambiguous_bytes = 0
+        self._pane_fold_certification_disabled = False
         self._wake_context_reload_guard = None
 
         # Cancel worker.
@@ -4737,6 +4835,34 @@ class TmuxSession(TransportReplacementMixin):
             )
             return False
 
+        # #667: durable inbound idempotency. A message already delivered to
+        # this agent in a prior life re-enters here carrying the same durable
+        # platform message_id but not the in-memory transport-accepted fence
+        # (which a restart wipes) — the realistic source is a platform poller
+        # re-fetching the same update after a bounce on an uncommitted offset.
+        # It would be re-pasted as a duplicate the user sees (and wasted work
+        # re-running the turn). Suppress it before any side effect
+        # (conversation log, stats, paste). Only external turns with a stable
+        # platform message_id are guarded; internal, wake, scheduler, and
+        # approval-drain turns carry no message_id and pass through — their
+        # re-delivery stays at-least-once, as the broker already documents.
+        # Return True — the message genuinely WAS delivered, so the caller
+        # commits its offset instead of retrying — never False, which the
+        # approval-drain path treats as a hard handoff failure.
+        if (
+            message_id
+            and not scheduler_serialized
+            and self._registry is not None
+            and self._registry.is_turn_delivered(
+                self.agent_name, platform, chat_id, message_id
+            )
+        ):
+            _log(
+                f"tmux[{self.agent_name}]: DROPPING already-delivered inbound "
+                f"message (idempotent #667; chat={chat_id}, msg={message_id})"
+            )
+            return True
+
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
 
@@ -4748,8 +4874,14 @@ class TmuxSession(TransportReplacementMixin):
                     self.id, "user", prompt,
                     platform=platform, chat_id=chat_id,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # Loud, like the assistant-side append handler: a silently
+                # swallowed failure here is indistinguishable from a quiet
+                # day, which hid a fleet-wide store freeze (#1145).
+                _log(
+                    f"tmux[{self.agent_name}]: conversation_store.append "
+                    f"(user) raised: {e}"
+                )
 
         queued_prompt = prompt + agent_hint if agent_hint else prompt
         turn = _QueuedTurn(
@@ -5059,9 +5191,26 @@ class TmuxSession(TransportReplacementMixin):
         if self._tailer is not None:
             self._tailer.wake()
 
-    def set_transcript_path(self, path: Path | str) -> None:
+    def set_transcript_path(
+        self,
+        path: Path | str,
+        *,
+        session_id: str,
+    ) -> bool:
         """Update the watched transcript path — called when SessionStart
         hook reports the actual path Claude Code is writing to.
+
+        #1148 session-lineage perimeter: external callers must provide a
+        non-empty ``session_id``. A new id is accepted during the
+        daemon-opened per-spawn first-bind window or when trusted recovery
+        consumed that window without establishing lineage. Once lineage is
+        established, only its repeat reports may update the path outside a
+        new window. Returns ``False`` on rejection so the HTTP boundary can
+        return a loud conflict.
+
+        Trusted filesystem discovery never calls this method. It uses the
+        separate ``_set_transcript_path_internal`` call site below, so no HTTP
+        payload shape can turn a missing session id into an internal bypass.
 
         Cleaner than guessing the path via mtime glob: the SessionStart
         hook fires before the first model call, so the tailer is
@@ -5127,6 +5276,48 @@ class TmuxSession(TransportReplacementMixin):
         delivery (not enqueue) so the wake turn stays at queue head
         and external sends queue behind — FIFO preserved (Murzik #571
         review).
+        """
+        requested_session_id = (session_id or "").strip()
+        # #1150 SF-1: the trust window suppresses the foreign-session lineage
+        # check, so it must open only for a genuine fresh spawn where a
+        # legitimately new id is expected. A --continue relaunch re-arms the
+        # pending flag, but its resumed id is already known and must match.
+        bind_window_open = (
+            self._tailer_first_bind_pending
+            and not self._last_launch_used_continue
+        )
+        bound_session_id = self._bound_transcript_session_id
+        rejection_reason = ""
+        if not requested_session_id:
+            rejection_reason = "missing_session_id"
+        elif (
+            bound_session_id
+            and not bind_window_open
+            and requested_session_id != bound_session_id
+        ):
+            rejection_reason = "foreign_session_id"
+
+        if rejection_reason:
+            self._stats["transcript_bind_rejections"] += 1
+            _log(
+                f"{_TRANSCRIPT_BIND_REJECTED_LOG_PREFIX} "
+                f"agent={self.agent_name} reason={rejection_reason} "
+                f"requested_session_id={requested_session_id[:12] or '<missing>'} "
+                f"bound_session_id={bound_session_id[:12] or '<none>'} "
+                f"bind_window_open={str(bind_window_open).lower()}"
+            )
+            return False
+
+        self._bound_transcript_session_id = requested_session_id
+        self._set_transcript_path_internal(path)
+        return True
+
+    def _set_transcript_path_internal(self, path: Path | str) -> None:
+        """Trusted call-site-only transcript rebind for daemon discovery.
+
+        This is intentionally a separate method rather than a flag on the
+        public hook path. Only in-process first-bind recovery calls it; the API
+        endpoint exposes ``set_transcript_path`` and cannot select this path.
         """
         if self._tailer is None:
             return
@@ -6615,10 +6806,11 @@ class TmuxSession(TransportReplacementMixin):
 
         Recovery decision needs ``_tailer_first_bind_pending`` and
         ``_last_launch_used_continue``, which the tailer doesn't know
-        about — keep it here at ``TmuxSession``. Route the rebind
-        through ``set_transcript_path`` so the existing first-bind
-        seek-to-start path (PR #564) handles the seek + flag-consume,
-        and so the #496 continue-launch reply-spam defense remains
+        about — keep it here at ``TmuxSession``. Route the rebind through
+        the call-site-only ``_set_transcript_path_internal`` method so the
+        existing first-bind seek-to-start path (PR #564) handles the seek +
+        flag-consume without making a missing external session id a trust
+        discriminator. The #496 continue-launch reply-spam defense remains
         intact for the predicate-evaluates-False branch.
 
         No-op when:
@@ -6663,7 +6855,7 @@ class TmuxSession(TransportReplacementMixin):
         )
         # Routes through the standard first-bind path → seeks to byte 0
         # and consumes the ``_tailer_first_bind_pending`` flag (PR #564).
-        self.set_transcript_path(discovered)
+        self._set_transcript_path_internal(discovered)
 
     async def _stop_tailer(self) -> None:
         """Stop the tailer if running. Idempotent.
@@ -7448,6 +7640,8 @@ class TmuxSession(TransportReplacementMixin):
                 list[tuple[int, int, str, bytes]],
             ] = {}
             incomplete: set[_TranscriptSourceKey] = set()
+            parsed_rows: set[_TranscriptSourceKey] = set()
+            budget_exhausted: set[_TranscriptSourceKey] = set()
             for key, start in scan_starts.items():
                 found: list[tuple[int, int, str, bytes]] = []
                 handle = handles[key]
@@ -7455,97 +7649,436 @@ class TmuxSession(TransportReplacementMixin):
                     handle.seek(start)
                     while budget_remaining > 0:
                         row_offset = handle.tell()
-                        raw = handle.readline(budget_remaining)
+                        read_budget = budget_remaining
+                        raw = handle.readline(read_budget)
                         if not raw:
                             break
                         budget_remaining -= len(raw)
                         if not raw.endswith(b"\n"):
                             incomplete.add(key)
+                            if (
+                                len(raw) == read_budget
+                                and os.fstat(_descriptor(handle)).st_size > handle.tell()
+                            ):
+                                budget_exhausted.add(key)
                             break
                         try:
                             parsed = json.loads(raw)
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             continue
-                        if (
-                            not isinstance(parsed, dict)
-                            or parsed.get("type") != "user"
-                        ):
+                        if not isinstance(parsed, dict):
+                            continue
+                        parsed_rows.add(key)
+                        row_end = row_offset + len(raw)
+                        if parsed.get("type") != "user":
                             continue
                         prompt = self._transcript_user_text(parsed)
                         if prompt is None:
                             continue
-                        found.append(
-                            (row_offset, row_offset + len(raw), prompt, raw)
-                        )
+                        found.append((row_offset, row_end, prompt, raw))
                         if _allocation_complete(key, found):
                             break
                     else:
                         incomplete.add(key)
+                        budget_exhausted.add(key)
                 except (AttributeError, OSError, TypeError, ValueError):
                     incomplete.add(key)
                 rows[key] = found
 
-            used: set[tuple[_TranscriptSourceKey, int]] = set()
-            verdicts: list[bool | None] = []
-            for entry, source in zip(candidates, sources, strict=True):
-                claimed: tuple[int, int, bytes] | None = None
-                if source is not None:
-                    (
-                        key,
-                        allocation_start,
-                        proof_available,
-                        fallback,
-                    ) = source
-                    for row_offset, row_end, prompt, raw in rows.get(key, []):
-                        occurrence = (key, row_offset)
+            # Phase 1 is the pre-#1163 exact allocator byte-for-byte: each
+            # candidate claims its oldest distinct exact row, including an
+            # already accepted candidate whose row must not be donated to a
+            # later duplicate. Exact-reserved rows are wholly unavailable to
+            # containment, even for a different nested prompt.
+            exact_rows: set[tuple[_TranscriptSourceKey, int]] = set()
+            claims: list[_TranscriptProbeRow | None] = [None] * len(candidates)
+            for index, (entry, source) in enumerate(
+                zip(candidates, sources, strict=True)
+            ):
+                if source is None:
+                    continue
+                key, allocation_start, _proof_available, _fallback = source
+                for row_offset, row_end, prompt, raw in rows.get(key, []):
+                    occurrence = (key, row_offset)
+                    if (
+                        row_offset >= allocation_start
+                        and occurrence not in exact_rows
+                        and prompt == entry.turn.prompt
+                    ):
+                        exact_rows.add(occurrence)
+                        claims[index] = _TranscriptProbeRow(
+                            row_offset,
+                            row_end,
+                            raw,
+                        )
+                        break
+
+            # Phase 2 allocates full-prompt occurrences inside folded rows to
+            # candidates still lacking an exact row. One folded row may prove
+            # several turns, but every character span is globally owned by at
+            # most one candidate. Candidate order remains the existing FIFO.
+            occupied_spans: dict[
+                tuple[_TranscriptSourceKey, int],
+                list[tuple[int, int]],
+            ] = {}
+            for index, (entry, source) in enumerate(
+                zip(candidates, sources, strict=True)
+            ):
+                candidate_prompt = entry.turn.prompt
+                if (
+                    claims[index] is not None
+                    or source is None
+                    or not candidate_prompt
+                ):
+                    continue
+                key, allocation_start, _proof_available, _fallback = source
+                for row_offset, row_end, prompt, raw in rows.get(key, []):
+                    row_key = (key, row_offset)
+                    if row_offset < allocation_start or row_key in exact_rows:
+                        continue
+                    spans = occupied_spans.setdefault(row_key, [])
+                    claimed_span = self._first_unoccupied_prompt_span(
+                        prompt,
+                        candidate_prompt,
+                        spans,
+                    )
+                    if claimed_span is None:
+                        continue
+                    spans.append(claimed_span)
+                    claims[index] = _TranscriptProbeRow(
+                        row_offset,
+                        row_end,
+                        raw,
+                    )
+                    break
+
+            # Fold chains need the complete enqueue-created occurrence history.
+            # A ticket-start scan can begin between an old remove and its delayed
+            # attachment, allowing that orphan to donate itself to a new cancel.
+            # Re-read only sources needed by phase 3 from byte zero, on the
+            # already-open descriptor and inside the same cumulative I/O budget.
+            phase3_keys = {
+                source[0]
+                for index, source in enumerate(sources)
+                if (
+                    claims[index] is None
+                    and source is not None
+                    and bool(candidates[index].turn.prompt)
+                )
+            }
+            chains: dict[
+                _TranscriptSourceKey,
+                list[_TranscriptProbeFoldChain],
+            ] = {}
+            fold_history_incomplete: set[_TranscriptSourceKey] = set()
+            for key in phase3_keys:
+                open_occurrences: list[_TranscriptProbeFoldOccurrence] = []
+                pending_removes: list[
+                    tuple[_TranscriptProbeFoldOccurrence, _TranscriptProbeRow]
+                ] = []
+                complete_chains: list[_TranscriptProbeFoldChain] = []
+                primary_chains: list[_TranscriptProbeFoldChain] = []
+                history_complete = False
+                handle = handles[key]
+
+                def _record_primary_chain(
+                    occurrence: _TranscriptProbeFoldOccurrence,
+                    remove: _TranscriptProbeRow,
+                    attachment: _TranscriptProbeRow,
+                ) -> None:
+                    """Record one FIFO chain plus two-attachment alternatives."""
+                    primary = _TranscriptProbeFoldChain(
+                        occurrence.prompt,
+                        occurrence.enqueue,
+                        remove,
+                        attachment,
+                    )
+                    primary_chains.append(primary)
+                    complete_chains.append(primary)
+                    # A replay can leave one attachment-first occurrence open
+                    # before its fresh redelivery. When both occurrences carry
+                    # attachments but only one remove lands, every realizable
+                    # attribution consumed the content at least once: either
+                    # the stale fold completed late or the redelivery folded.
+                    # Requiring this primary attachment and each alternative's
+                    # attachment is the two-attachment discriminator; a cancel
+                    # with only one attachment never gains this attribution.
+                    complete_chains.extend(
+                        _TranscriptProbeFoldChain(
+                            occurrence.prompt,
+                            alternative.enqueue,
+                            remove,
+                            alternative.attachment,
+                        )
+                        for alternative in open_occurrences
                         if (
-                            row_offset >= allocation_start
-                            and occurrence not in used
-                            and prompt == entry.turn.prompt
-                        ):
-                            used.add(occurrence)
-                            claimed = (row_offset, row_end, raw)
+                            alternative.prompt == occurrence.prompt
+                            and alternative.attachment is not None
+                        )
+                    )
+
+                try:
+                    handle.seek(0)
+                    while budget_remaining > 0:
+                        row_offset = handle.tell()
+                        raw = handle.readline(budget_remaining)
+                        if not raw:
+                            history_complete = True
                             break
+                        budget_remaining -= len(raw)
+                        if not raw.endswith(b"\n"):
+                            break
+                        try:
+                            parsed = json.loads(raw)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            break
+                        if not isinstance(parsed, dict):
+                            continue
+                        row = _TranscriptProbeRow(
+                            row_offset,
+                            row_offset + len(raw),
+                            raw,
+                        )
+                        entry_type = parsed.get("type")
+                        if entry_type == "queue-operation":
+                            operation = parsed.get("operation")
+                            content = parsed.get("content")
+                            if operation == "enqueue" and isinstance(content, str):
+                                open_occurrences.append(
+                                    _TranscriptProbeFoldOccurrence(content, row)
+                                )
+                            elif operation == "remove" and isinstance(content, str):
+                                matching_enqueue = next(
+                                    (
+                                        index
+                                        for index, occurrence in enumerate(
+                                            open_occurrences
+                                        )
+                                        if occurrence.prompt == content
+                                    ),
+                                    None,
+                                )
+                                if matching_enqueue is None:
+                                    continue
+                                occurrence = open_occurrences.pop(
+                                    matching_enqueue
+                                )
+                                if occurrence.attachment is None:
+                                    pending_removes.append((occurrence, row))
+                                else:
+                                    _record_primary_chain(
+                                        occurrence,
+                                        row,
+                                        occurrence.attachment,
+                                    )
+                            continue
+
+                        if entry_type != "attachment":
+                            continue
+                        attachment = parsed.get("attachment")
+                        if (
+                            not isinstance(attachment, dict)
+                            or attachment.get("type") != "queued_command"
+                            or not isinstance(attachment.get("prompt"), str)
+                        ):
+                            continue
+                        prompt = attachment["prompt"]
+                        matching_remove = next(
+                            (
+                                index
+                                for index, (occurrence, _remove) in enumerate(
+                                    pending_removes
+                                )
+                                if occurrence.prompt == prompt
+                            ),
+                            None,
+                        )
+                        if matching_remove is not None:
+                            occurrence, remove = pending_removes.pop(
+                                matching_remove
+                            )
+                            _record_primary_chain(
+                                occurrence,
+                                remove,
+                                row,
+                            )
+                            continue
+                        open_occurrence = next(
+                            (
+                                occurrence
+                                for occurrence in open_occurrences
+                                if (
+                                    occurrence.prompt == prompt
+                                    and occurrence.attachment is None
+                                )
+                            ),
+                            None,
+                        )
+                        if open_occurrence is not None:
+                            open_occurrence.attachment = row
+                            # The primary remove may have landed before this
+                            # fresh attachment. Complete the same A-prime
+                            # alternative only now that both attachments exist.
+                            complete_chains.extend(
+                                _TranscriptProbeFoldChain(
+                                    prompt,
+                                    open_occurrence.enqueue,
+                                    primary.remove,
+                                    row,
+                                )
+                                for primary in primary_chains
+                                if primary.prompt == prompt
+                            )
+                except (AttributeError, OSError, TypeError, ValueError):
+                    history_complete = False
+                if history_complete:
+                    chains[key] = complete_chains
+                else:
+                    chains[key] = []
+                    fold_history_incomplete.add(key)
+
+            # Phase 3 allocates exact three-leg fold chains to candidates that
+            # own no user-row claim. A chain is reserved before provenance is
+            # evaluated: an unavailable or pre-ticket occurrence may cause
+            # conservative under-acceptance, but it can never be donated to a
+            # later equal prompt and turned into a false positive.
+            chain_claims: list[list[_TranscriptProbeFoldChain]] = [
+                [] for _candidate in candidates
+            ]
+            reserved_chains: set[tuple[_TranscriptSourceKey, int]] = set()
+            for index, (entry, source) in enumerate(
+                zip(candidates, sources, strict=True)
+            ):
+                candidate_prompt = entry.turn.prompt
+                if (
+                    claims[index] is not None
+                    or source is None
+                    or not candidate_prompt
+                ):
+                    continue
+                key = source[0]
+                # Greedily reserve every equal-prompt chain for this candidate
+                # before any ticket is evaluated. Candidate FIFO plus the
+                # global reservation prevents a stale/unavailable occurrence
+                # from being donated forward, while any independently fresh
+                # chain can still prove consumption. An equal-prompt twin may
+                # conservatively starve here, which is duplicate-at-worst.
+                for chain_index, chain in enumerate(chains.get(key, [])):
+                    occurrence = (key, chain_index)
+                    if (
+                        occurrence in reserved_chains
+                        or chain.prompt != candidate_prompt
+                    ):
+                        continue
+                    reserved_chains.add(occurrence)
+                    chain_claims[index].append(chain)
+
+            def _probe_row_is_paste_bound(
+                entry: _InflightMeta,
+                row: _TranscriptProbeRow,
+                *,
+                proof_available: bool,
+            ) -> bool:
+                """Apply the existing #1169 boundary proof to one row."""
+                if not proof_available:
+                    return False
+                offset = entry.transcript_offset_at_paste
+                anchor_start = entry.transcript_anchor_start_at_paste
+                anchor = entry.transcript_anchor_at_paste
+                if offset is not None and row.end > offset:
+                    return True
+                if (
+                    offset is None
+                    or anchor_start is None
+                    or anchor is None
+                    or row.end > offset
+                ):
+                    return False
+                overlap_start = max(row.offset, anchor_start)
+                overlap_end = min(row.end, offset)
+                if overlap_start >= overlap_end:
+                    return False
+                prior_start = overlap_start - anchor_start
+                prior_end = overlap_end - anchor_start
+                current_start = overlap_start - row.offset
+                current_end = overlap_end - row.offset
+                prior = anchor[prior_start:prior_end]
+                current = row.raw[current_start:current_end]
+                # JSONL rows are atomic: any changed byte in the captured
+                # extent proves a post-ticket rewrite. An identical partial
+                # overlap remains non-positive because its prefix is unknown.
+                return len(prior) == len(current) and prior != current
+
+            verdicts: list[bool | None] = []
+            for index, (entry, source) in enumerate(
+                zip(candidates, sources, strict=True)
+            ):
+                claimed = claims[index]
+                claimed_chains = chain_claims[index]
+                if source is not None:
+                    key, _allocation_start, proof_available, fallback = source
                 else:
                     key = None
                     proof_available = False
                     fallback = None
 
-                paste_bound = False
-                if claimed is not None and proof_available and key is not None:
-                    row_offset, row_end, raw = claimed
-                    offset = entry.transcript_offset_at_paste
-                    anchor_start = entry.transcript_anchor_start_at_paste
-                    anchor = entry.transcript_anchor_at_paste
-                    if offset is not None and row_end > offset:
-                        paste_bound = True
-                    elif (
-                        offset is not None
-                        and anchor_start is not None
-                        and anchor is not None
-                        and row_end <= offset
-                    ):
-                        overlap_start = max(row_offset, anchor_start)
-                        overlap_end = min(row_end, offset)
-                        if overlap_start < overlap_end:
-                            prior_start = overlap_start - anchor_start
-                            prior_end = overlap_end - anchor_start
-                            current_start = overlap_start - row_offset
-                            current_end = overlap_end - row_offset
-                            prior = anchor[prior_start:prior_end]
-                            current = raw[current_start:current_end]
-                            # JSONL rows are atomic: any changed byte in the
-                            # captured extent proves a post-ticket rewrite.
-                            # An identical partial overlap remains non-positive
-                            # because the uncaptured prefix is unknowable.
-                            paste_bound = (
-                                len(prior) == len(current) and prior != current
+                paste_bound = (
+                    claimed is not None
+                    and _probe_row_is_paste_bound(
+                        entry,
+                        claimed,
+                        proof_available=proof_available,
+                    )
+                )
+                if claimed_chains:
+                    paste_bound = key is not None and any(
+                        self._fold_pair_rows_share_occurrence(
+                            enqueue_offset=claimed_chain.enqueue.offset,
+                            enqueue_identity=key,
+                            remove_offset=claimed_chain.remove.offset,
+                            remove_identity=key,
+                            attachment_offset=claimed_chain.attachment.offset,
+                            attachment_identity=key,
+                        )
+                        and all(
+                            _probe_row_is_paste_bound(
+                                entry,
+                                row,
+                                proof_available=proof_available,
                             )
+                            for row in (
+                                claimed_chain.enqueue,
+                                claimed_chain.remove,
+                                claimed_chain.attachment,
+                            )
+                        )
+                        for claimed_chain in claimed_chains
+                    )
 
                 if entry.turn.transport_accepted:
                     verdicts.append(True)
                 elif paste_bound:
                     verdicts.append(True)
+                elif (
+                    claimed is None
+                    and key is not None
+                    and bool(entry.turn.prompt)
+                    and key in fold_history_incomplete
+                    and (
+                        key in budget_exhausted
+                        or key not in incomplete
+                        or key in parsed_rows
+                    )
+                ):
+                    # A partial byte-zero reconstruction cannot classify an
+                    # orphan safely. This fold-candidate verdict takes
+                    # precedence over the legacy unavailable-source branch:
+                    # a complete row or a budget-caused phase-1 end made the
+                    # opened source available, but its fold history is
+                    # ambiguous, so recovery is replay (False), not drain
+                    # (None). Exceptions and genuine first-row partials
+                    # retain the legacy unavailable verdict.
+                    verdicts.append(False)
                 elif (
                     key is not None
                     and key in incomplete
@@ -8104,6 +8637,13 @@ class TmuxSession(TransportReplacementMixin):
                 # (capture-pane + sample gap), during which a stop hook can pop or
                 # advance the head out from under us.
                 head_meta = self._inflight_metas[0]
+                if verdict != "idle":
+                    # Grace is per idle-entry, not per turn lifetime. If the
+                    # pane becomes active between samples, the next idle streak
+                    # must earn a fresh first-pass recheck. Two consecutive idle
+                    # samples still consume the latch and reconcile, so
+                    # busy/idle oscillation cannot create an unbounded deferral.
+                    self._inflight_idle_grace_head = None
                 restart_reason: str | None = None
                 if verdict == "growing":
                     # #118: head aged out BUT the transcript is still being
@@ -8137,6 +8677,35 @@ class TmuxSession(TransportReplacementMixin):
                     consumption_verdicts = self._phantom_consumption_verdicts(
                         candidates
                     )
+                    if (
+                        any(consumed is False for consumed in consumption_verdicts)
+                        and self._inflight_idle_grace_head is not head_meta
+                    ):
+                        # #1156: the REPL can consume pane input at the end of a
+                        # long turn just before its transcript row becomes
+                        # visible. Preserve every owner/bookkeeping field and
+                        # re-run the authoritative transcript probe next tick.
+                        # The aged head clock is intentionally NOT reset, making
+                        # this exactly one watchdog-cycle of grace.
+                        self._inflight_idle_grace_head = head_meta
+                        _log(
+                            f"tmux[{self.agent_name}]: inflight head aged "
+                            f"{age:.1f}s and REPL is idle but transcript proof "
+                            f"is absent — deferring reconciliation for one "
+                            f"watchdog tick (#1156; deque depth={depth})"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight",
+                            agent=self.agent_name,
+                            decision="skip",
+                            reason="phantom_consumption_grace",
+                            state=self.state.value,
+                            progress_stale_s=age,
+                            inflight_turns=depth,
+                            inflight_active=False,
+                        )
+                        continue
+                    self._inflight_idle_grace_head = None
                     self._inflight_metas.clear()
                     self._head_started_at = None
                     self._inflight_pane_ext_anchor = None
@@ -8144,6 +8713,7 @@ class TmuxSession(TransportReplacementMixin):
                     replay: list[_QueuedTurn] = []
                     drained_count = 0
                     dropped_count = 0
+                    ledger_suppressed_count = 0
                     terminal_fenced_count = 0
                     unavailable_count = sum(
                         consumed is None for consumed in consumption_verdicts
@@ -8164,6 +8734,68 @@ class TmuxSession(TransportReplacementMixin):
                         header = turn.prompt.splitlines()[0] if turn.prompt else ""
 
                         if consumed is False:
+                            ledgered = False
+                            if (
+                                turn.message_id
+                                and not turn.scheduler_serialized
+                                and self._registry is not None
+                            ):
+                                try:
+                                    ledgered = self._registry.is_turn_delivered(
+                                        self.agent_name,
+                                        turn.platform,
+                                        turn.chat_id,
+                                        turn.message_id,
+                                    )
+                                except Exception as exc:
+                                    # This is a duplicate-suppression backstop,
+                                    # never proof by itself. Registry uncertainty
+                                    # must fail open to today's replay behavior.
+                                    _log(
+                                        f"tmux[{self.agent_name}]: "
+                                        "PHANTOM_LEDGER_READ_FAILURE; failing "
+                                        "open to requeue "
+                                        f"(message_id={turn.message_id!r}, "
+                                        f"{type(exc).__name__}: {exc})"
+                                    )
+                            if ledgered:
+                                ledger_suppressed_count += 1
+                                scheduler_state = self._receipt_state_label(
+                                    turn.scheduler_delivery
+                                )
+                                submission_state = self._receipt_state_label(
+                                    turn.submission_receipt
+                                )
+                                _log(
+                                    f"tmux[{self.agent_name}]: "
+                                    "PHANTOM_SUPPRESSED_LEDGERED dropping "
+                                    "already-delivered phantom instead of "
+                                    "duplicate replay "
+                                    f"(platform={turn.platform!r}, "
+                                    f"chat_id={turn.chat_id!r}, "
+                                    f"message_id={turn.message_id!r}, "
+                                    f"scheduler_receipt={scheduler_state}, "
+                                    f"submission_receipt={submission_state}, "
+                                    f"prompt_header={header!r})"
+                                )
+                                ev = entry.completion_event
+                                if ev is not None and not ev.is_set():
+                                    ev.set()
+                                delivery = turn.scheduler_delivery
+                                if delivery is not None and not delivery.done():
+                                    delivery.set_result(False)
+                                self._resolve_submission_receipt(turn, False)
+                                log_watchdog_decision(
+                                    watchdog="inflight",
+                                    agent=self.agent_name,
+                                    decision="drop",
+                                    reason="phantom_suppressed_ledgered",
+                                    state=self.state.value,
+                                    progress_stale_s=age,
+                                    inflight_turns=depth,
+                                    inflight_active=False,
+                                )
+                                continue
                             if turn.scheduler_serialized:
                                 # The ordinary queue becomes the sole replay
                                 # owner before the turn is made visible there.
@@ -8219,6 +8851,7 @@ class TmuxSession(TransportReplacementMixin):
                             # The old pane occurrence has no transcript proof.
                             # Re-arm all paste/acceptance bookkeeping so the
                             # worker records one fresh meta for the replay.
+                            self._purge_fold_removes_for_turn(turn)
                             turn.pane_delivery_recorded = False
                             turn.pane_delivery_started = False
                             turn.pane_queue_enqueued = False
@@ -8233,6 +8866,7 @@ class TmuxSession(TransportReplacementMixin):
                                 progress_stale_s=age,
                                 inflight_turns=depth,
                                 inflight_active=False,
+                                prompt_header=header,
                             )
                             continue
 
@@ -8268,6 +8902,12 @@ class TmuxSession(TransportReplacementMixin):
                         )
 
                     self._prepend_message_queue(replay)
+                    if ledger_suppressed_count:
+                        _log(
+                            f"tmux[{self.agent_name}]: "
+                            "PHANTOM_LEDGER_SUPPRESSION_SUMMARY "
+                            f"suppressed={ledger_suppressed_count}"
+                        )
                     _log(
                         f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
                         f"but REPL is idle — reconciled {drained_count} phantom "
@@ -8831,6 +9471,56 @@ class TmuxSession(TransportReplacementMixin):
             unique.setdefault(id(turn), turn)
         return sorted(unique.values(), key=lambda turn: turn.queued_at)
 
+    @staticmethod
+    def _first_unoccupied_prompt_span(
+        content: str,
+        prompt: str,
+        occupied: list[tuple[int, int]],
+    ) -> tuple[int, int] | None:
+        """Return the first full prompt occurrence not overlapping a claim."""
+        if not prompt:
+            return None
+        search_from = 0
+        while True:
+            start = content.find(prompt, search_from)
+            if start < 0:
+                return None
+            end = start + len(prompt)
+            if all(
+                end <= used_start or start >= used_end
+                for used_start, used_end in occupied
+            ):
+                return start, end
+            search_from = start + 1
+
+    def _folded_acceptance_turns(self, content: str) -> list[_QueuedTurn]:
+        """Allocate one folded user-row occurrence per pending pane turn."""
+        occupied: list[tuple[int, int]] = []
+        matched: list[_QueuedTurn] = []
+        for turn in self._acceptance_candidates():
+            if not turn.pane_delivery_started or not turn.prompt:
+                continue
+            if (
+                not turn.transport_accepted
+                and turn.submission_receipt is not None
+                and turn.submission_receipt.done()
+                and not self._receipt_accepted(turn.submission_receipt)
+            ):
+                continue
+            span = self._first_unoccupied_prompt_span(
+                content,
+                turn.prompt,
+                occupied,
+            )
+            if span is None:
+                continue
+            occupied.append(span)
+            # Accepted occurrences still reserve their span so a replayed row
+            # cannot donate it, but _mark_transport_accepted must not run twice.
+            if not turn.transport_accepted:
+                matched.append(turn)
+        return matched
+
     def _match_acceptance_turn(
         self, prompt: str, *, for_enqueue: bool = False
     ) -> _QueuedTurn | None:
@@ -8859,6 +9549,514 @@ class TmuxSession(TransportReplacementMixin):
         return None
 
     @staticmethod
+    def _transcript_entry_matches_ticket(
+        *,
+        entry_offset: int | None,
+        source_identity: tuple[int, int] | None,
+        ticket_offset: int | None,
+        ticket_identity: tuple[int, int] | None,
+    ) -> bool:
+        """Whether one live row is bound to a frozen pre-paste ticket."""
+        return bool(
+            source_identity is not None
+            and ticket_identity is not None
+            and source_identity == ticket_identity
+            and entry_offset is not None
+            and ticket_offset is not None
+            and entry_offset >= ticket_offset
+        )
+
+    @staticmethod
+    def _fold_pair_rows_share_occurrence(
+        *,
+        enqueue_offset: int | None,
+        enqueue_identity: tuple[int, int] | None,
+        remove_offset: int | None,
+        remove_identity: tuple[int, int] | None,
+        attachment_offset: int | None,
+        attachment_identity: tuple[int, int] | None,
+        occurrence_ids: tuple[int | None, int | None, int | None] | None = None,
+    ) -> bool:
+        """Require one source-local, enqueue-created fold occurrence."""
+        identities = (
+            enqueue_identity,
+            remove_identity,
+            attachment_identity,
+        )
+        offsets = (
+            enqueue_offset,
+            remove_offset,
+            attachment_offset,
+        )
+        if (
+            any(identity is None for identity in identities)
+            or len(set(identities)) != 1
+            or any(offset is None for offset in offsets)
+        ):
+            return False
+        assert enqueue_offset is not None
+        assert remove_offset is not None
+        assert attachment_offset is not None
+        if not (
+            enqueue_offset < remove_offset
+            and enqueue_offset < attachment_offset
+        ):
+            return False
+        if occurrence_ids is None:
+            return True
+        return (
+            all(occurrence_id is not None for occurrence_id in occurrence_ids)
+            and len(set(occurrence_ids)) == 1
+        )
+
+    def _inflight_meta_for_turn(
+        self, turn: _QueuedTurn | None
+    ) -> _InflightMeta | None:
+        """Return the live metadata that owns ``turn``, if it still exists."""
+        if turn is None:
+            return None
+        return next(
+            (meta for meta in self._inflight_metas if meta.turn is turn),
+            None,
+        )
+
+    @staticmethod
+    def _fold_pair_prompt_bytes(prompt: str) -> int:
+        """Stable byte accounting for hostile or malformed prompt text."""
+        return len(prompt.encode("utf-8", errors="replace"))
+
+    def _next_fold_occurrence_id(self) -> int:
+        """Allocate one enqueue-created identity inside this pane epoch."""
+        occurrence_id = self._pane_fold_next_occurrence_id
+        self._pane_fold_next_occurrence_id += 1
+        return occurrence_id
+
+    @staticmethod
+    def _fold_pair_key(
+        prompt: str,
+        source_identity: tuple[int, int] | None,
+    ) -> _FoldPairKey:
+        return source_identity, prompt
+
+    def _fold_pair_key_is_ambiguous(
+        self,
+        prompt: str,
+        source_identity: tuple[int, int] | None,
+    ) -> bool:
+        return (
+            self._pane_fold_certification_disabled
+            or self._fold_pair_key(prompt, source_identity)
+            in self._pane_fold_ambiguous_keys
+        )
+
+    def _log_fold_pair_eviction(
+        self,
+        *,
+        operation: str,
+        prompt: str,
+        bounds: list[str],
+    ) -> None:
+        header = prompt.splitlines()[0] if prompt else ""
+        _log(
+            f"tmux[{self.agent_name}]: FOLD_PAIR_EVIDENCE_EVICT "
+            f"operation={operation} prompt_header={header!r} "
+            f"bound={'+'.join(bounds)}"
+        )
+
+    def _purge_fold_pair_key(self, key: _FoldPairKey) -> None:
+        """Drop both split-cache sides for one exact key with exact accounting."""
+        source_identity, prompt = key
+        kept_attachments: deque[_QueuedCommandAttachmentEvidence] = deque()
+        removed_attachment_bytes = 0
+        removed_attachments = False
+        for evidence in self._pane_fold_attachments:
+            if (
+                evidence.source_identity == source_identity
+                and evidence.prompt == prompt
+            ):
+                removed_attachments = True
+                removed_attachment_bytes += self._fold_pair_prompt_bytes(
+                    evidence.prompt
+                )
+            else:
+                kept_attachments.append(evidence)
+        if removed_attachments:
+            self._pane_fold_attachments = kept_attachments
+            self._pane_fold_attachment_bytes -= removed_attachment_bytes
+
+        kept_removes: deque[_RemovedPromptEvidence] = deque()
+        removed_remove_bytes = 0
+        removed_removes = False
+        for evidence in self._pane_fold_removes:
+            if (
+                evidence.source_identity == source_identity
+                and (evidence.queued.content or "") == prompt
+            ):
+                removed_removes = True
+                removed_remove_bytes += self._fold_pair_prompt_bytes(prompt)
+            else:
+                kept_removes.append(evidence)
+        if removed_removes:
+            self._pane_fold_removes = kept_removes
+            self._pane_fold_remove_bytes -= removed_remove_bytes
+
+    def _fence_fold_pair_key(
+        self,
+        *,
+        prompt: str,
+        source_identity: tuple[int, int] | None,
+        side: str,
+        reason: str,
+        bounds: list[str] | None = None,
+    ) -> None:
+        """Make one lost occurrence permanently non-positive for this epoch."""
+        key = self._fold_pair_key(prompt, source_identity)
+        first_fence = (
+            not self._pane_fold_certification_disabled
+            and key not in self._pane_fold_ambiguous_keys
+        )
+        if first_fence:
+            prompt_bytes = self._fold_pair_prompt_bytes(prompt)
+            exceeded: list[str] = []
+            if (
+                len(self._pane_fold_ambiguous_keys) + 1
+                > _FOLD_PAIR_MAX_OCCURRENCES
+            ):
+                exceeded.append("occurrence")
+            if (
+                self._pane_fold_ambiguous_bytes + prompt_bytes
+                > _FOLD_PAIR_MAX_PROMPT_BYTES
+            ):
+                exceeded.append("byte")
+            if exceeded:
+                self._pane_fold_certification_disabled = True
+                self._pane_fold_ambiguous_keys.clear()
+                self._pane_fold_ambiguous_bytes = 0
+                header = prompt.splitlines()[0] if prompt else ""
+                _log(
+                    f"tmux[{self.agent_name}]: "
+                    "FOLD_PAIR_CERTIFICATION_DISABLED "
+                    f"side={side} reason={reason} "
+                    f"bound={'+'.join(exceeded)} "
+                    f"prompt_header={header!r}"
+                )
+            else:
+                self._pane_fold_ambiguous_keys.add(key)
+                self._pane_fold_ambiguous_bytes += prompt_bytes
+                header = prompt.splitlines()[0] if prompt else ""
+                bound_text = (
+                    f" bound={'+'.join(bounds)}" if bounds else ""
+                )
+                _log(
+                    f"tmux[{self.agent_name}]: FOLD_PAIR_OCCURRENCE_AMBIGUOUS "
+                    f"side={side} reason={reason}{bound_text} "
+                    f"prompt_header={header!r}"
+                )
+
+        # G1 occurrence IDs prevent ordinary cross-pairing. This G2 fence is
+        # independently required once either split-cache side is lost: equal
+        # bytes cannot prove which occurrence owns a later orphan.
+        self._purge_fold_pair_key(key)
+
+    def _trim_fold_attachments(self) -> None:
+        """Enforce both live attachment-cache bounds, oldest first."""
+        while self._pane_fold_attachments:
+            bounds: list[str] = []
+            if len(self._pane_fold_attachments) > _FOLD_PAIR_MAX_OCCURRENCES:
+                bounds.append("occurrence")
+            if self._pane_fold_attachment_bytes > _FOLD_PAIR_MAX_PROMPT_BYTES:
+                bounds.append("byte")
+            if not bounds:
+                return
+            evicted = self._pane_fold_attachments[0]
+            self._log_fold_pair_eviction(
+                operation="attachment",
+                prompt=evicted.prompt,
+                bounds=bounds,
+            )
+            if evicted.occurrence_id is None:
+                self._pane_fold_attachments.popleft()
+                self._pane_fold_attachment_bytes -= self._fold_pair_prompt_bytes(
+                    evicted.prompt
+                )
+            else:
+                self._fence_fold_pair_key(
+                    prompt=evicted.prompt,
+                    source_identity=evicted.source_identity,
+                    side="attachment",
+                    reason="eviction",
+                    bounds=bounds,
+                )
+
+    def _trim_fold_removes(self) -> None:
+        """Enforce both live remove-cache bounds, oldest first."""
+        while self._pane_fold_removes:
+            bounds: list[str] = []
+            if len(self._pane_fold_removes) > _FOLD_PAIR_MAX_OCCURRENCES:
+                bounds.append("occurrence")
+            if self._pane_fold_remove_bytes > _FOLD_PAIR_MAX_PROMPT_BYTES:
+                bounds.append("byte")
+            if not bounds:
+                return
+            evicted = self._pane_fold_removes[0]
+            prompt = evicted.queued.content or ""
+            self._log_fold_pair_eviction(
+                operation="remove",
+                prompt=prompt,
+                bounds=bounds,
+            )
+            self._fence_fold_pair_key(
+                prompt=prompt,
+                source_identity=evicted.source_identity,
+                side="remove",
+                reason="eviction",
+                bounds=bounds,
+            )
+
+    def _cache_fold_attachment(
+        self, evidence: _QueuedCommandAttachmentEvidence
+    ) -> None:
+        self._pane_fold_attachments.append(evidence)
+        self._pane_fold_attachment_bytes += self._fold_pair_prompt_bytes(
+            evidence.prompt
+        )
+        self._trim_fold_attachments()
+
+    def _cache_fold_remove(self, evidence: _RemovedPromptEvidence) -> None:
+        self._pane_fold_removes.append(evidence)
+        self._pane_fold_remove_bytes += self._fold_pair_prompt_bytes(
+            evidence.queued.content or ""
+        )
+        self._trim_fold_removes()
+
+    def _pop_fold_attachment(
+        self, index: int
+    ) -> _QueuedCommandAttachmentEvidence:
+        evidence = self._pane_fold_attachments[index]
+        del self._pane_fold_attachments[index]
+        self._pane_fold_attachment_bytes -= self._fold_pair_prompt_bytes(
+            evidence.prompt
+        )
+        return evidence
+
+    def _pop_fold_remove(self, index: int) -> _RemovedPromptEvidence:
+        evidence = self._pane_fold_removes[index]
+        del self._pane_fold_removes[index]
+        self._pane_fold_remove_bytes -= self._fold_pair_prompt_bytes(
+            evidence.queued.content or ""
+        )
+        return evidence
+
+    def _certify_fold_remove_pair(
+        self,
+        removed: _RemovedPromptEvidence,
+        attachment: _QueuedCommandAttachmentEvidence,
+    ) -> None:
+        """Certify one consumed pair only when every frozen leg is valid."""
+        queued = removed.queued
+        if (
+            queued.retired
+            or queued.turn is None
+            or queued.content != attachment.prompt
+            or attachment.occurrence_id != queued.occurrence_id
+            or self._fold_pair_key_is_ambiguous(
+                attachment.prompt,
+                removed.source_identity,
+            )
+        ):
+            return
+        ticket_offset = queued.ticket_offset
+        ticket_identity = queued.ticket_identity
+        if not self._fold_pair_rows_share_occurrence(
+            enqueue_offset=queued.entry_offset,
+            enqueue_identity=queued.source_identity,
+            remove_offset=removed.entry_offset,
+            remove_identity=removed.source_identity,
+            attachment_offset=attachment.entry_offset,
+            attachment_identity=attachment.source_identity,
+            occurrence_ids=(
+                queued.occurrence_id,
+                removed.queued.occurrence_id,
+                attachment.occurrence_id,
+            ),
+        ):
+            return
+        rows = (
+            (queued.entry_offset, queued.source_identity),
+            (removed.entry_offset, removed.source_identity),
+            (attachment.entry_offset, attachment.source_identity),
+        )
+        if not all(
+            self._transcript_entry_matches_ticket(
+                entry_offset=row_offset,
+                source_identity=row_identity,
+                ticket_offset=ticket_offset,
+                ticket_identity=ticket_identity,
+            )
+            for row_offset, row_identity in rows
+        ):
+            return
+        self._mark_transport_accepted(queued.turn)
+
+    def _handle_fold_attachment(
+        self,
+        prompt: str,
+        *,
+        entry_offset: int | None,
+        source_identity: tuple[int, int] | None,
+    ) -> None:
+        matching_remove = None
+        occurrence_id = None
+        if not self._fold_pair_key_is_ambiguous(prompt, source_identity):
+            matching_remove = next(
+                (
+                    index
+                    for index, removed in enumerate(self._pane_fold_removes)
+                    if (
+                        removed.queued.content == prompt
+                        and removed.queued.source_identity == source_identity
+                        and removed.source_identity == source_identity
+                    )
+                ),
+                None,
+            )
+            if matching_remove is not None:
+                occurrence_id = self._pane_fold_removes[
+                    matching_remove
+                ].queued.occurrence_id
+            else:
+                owned_occurrences = {
+                    evidence.occurrence_id
+                    for evidence in self._pane_fold_attachments
+                    if evidence.occurrence_id is not None
+                }
+                open_enqueue = next(
+                    (
+                        evidence
+                        for evidence in self._pane_queue_operations
+                        if (
+                            evidence.content == prompt
+                            and evidence.source_identity == source_identity
+                            and evidence.occurrence_id not in owned_occurrences
+                        )
+                    ),
+                    None,
+                )
+                if open_enqueue is not None:
+                    occurrence_id = open_enqueue.occurrence_id
+        attachment = _QueuedCommandAttachmentEvidence(
+            prompt,
+            occurrence_id,
+            entry_offset,
+            source_identity,
+        )
+        if matching_remove is None:
+            self._cache_fold_attachment(attachment)
+            return
+        removed = self._pop_fold_remove(matching_remove)
+        self._certify_fold_remove_pair(removed, attachment)
+
+    def _handle_fold_remove(
+        self,
+        queued: _QueuedPromptEvidence,
+        *,
+        entry_offset: int | None,
+        source_identity: tuple[int, int] | None,
+    ) -> None:
+        removed = _RemovedPromptEvidence(
+            queued,
+            entry_offset,
+            source_identity,
+        )
+        content = queued.content or ""
+        matching_attachment = None
+        if not self._fold_pair_key_is_ambiguous(content, source_identity):
+            matching_attachment = next(
+                (
+                    index
+                    for index, attachment in enumerate(
+                        self._pane_fold_attachments
+                    )
+                    if (
+                        attachment.prompt == content
+                        and attachment.source_identity == source_identity
+                        and attachment.occurrence_id == queued.occurrence_id
+                    )
+                ),
+                None,
+            )
+        if matching_attachment is None:
+            self._cache_fold_remove(removed)
+            return
+        attachment = self._pop_fold_attachment(matching_attachment)
+        self._certify_fold_remove_pair(removed, attachment)
+
+    def _purge_fold_removes_for_turn(self, turn: _QueuedTurn) -> None:
+        """Drop old occurrence ownership before this turn is replay-armed."""
+        keys: list[_FoldPairKey] = []
+        seen: set[_FoldPairKey] = set()
+
+        def _remember_key(key: _FoldPairKey) -> None:
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+
+        owned_occurrences: set[tuple[tuple[int, int] | None, int]] = set()
+        for evidence in self._pane_fold_removes:
+            if evidence.queued.turn is turn:
+                owned_occurrences.add(
+                    (
+                        evidence.queued.source_identity,
+                        evidence.queued.occurrence_id,
+                    )
+                )
+                _remember_key(
+                    self._fold_pair_key(
+                        evidence.queued.content or "",
+                        evidence.source_identity,
+                    )
+                )
+        for index, evidence in enumerate(self._pane_queue_operations):
+            if evidence.turn is not turn:
+                continue
+            owned_occurrences.add(
+                (evidence.source_identity, evidence.occurrence_id)
+            )
+            _remember_key(
+                self._fold_pair_key(
+                    evidence.content or "",
+                    evidence.source_identity,
+                )
+            )
+            # Preserve the native FIFO slot for M3's contentless dequeue, but
+            # retire its acceptance ownership before the same turn is replayed.
+            # Deleting it would shift a later occurrence onto the wrong turn.
+            if not evidence.retired:
+                self._pane_queue_operations[index] = replace(
+                    evidence,
+                    retired=True,
+                )
+        for evidence in self._pane_fold_attachments:
+            if (
+                evidence.occurrence_id is not None
+                and (evidence.source_identity, evidence.occurrence_id)
+                in owned_occurrences
+            ):
+                _remember_key(
+                    self._fold_pair_key(
+                        evidence.prompt,
+                        evidence.source_identity,
+                    )
+                )
+        for source_identity, prompt in keys:
+            self._fence_fold_pair_key(
+                prompt=prompt,
+                source_identity=source_identity,
+                side="remove",
+                reason="replay_purge",
+            )
+
+    @staticmethod
     def _turn_has_unresolved_acceptance(turn: _QueuedTurn) -> bool:
         """Whether a consumed-content ticket must survive a racing Stop."""
         if turn.transport_accepted:
@@ -8881,6 +10079,14 @@ class TmuxSession(TransportReplacementMixin):
             for evidence in self._pane_dequeued_turns
             if not evidence.retired and evidence.turn is not None
         )
+        candidates.extend(
+            evidence.queued.turn
+            for evidence in self._pane_fold_removes
+            if (
+                not evidence.queued.retired
+                and evidence.queued.turn is not None
+            )
+        )
         seen: set[int] = set()
         for turn in candidates:
             identity = id(turn)
@@ -8896,11 +10102,17 @@ class TmuxSession(TransportReplacementMixin):
 
     def _retire_acceptance_evidence(self, turn: _QueuedTurn) -> None:
         """Tombstone this occurrence without shifting the native FIFO ledger."""
+        for index, evidence in enumerate(self._pane_fold_removes):
+            if evidence.queued.turn is turn:
+                self._pane_fold_removes[index] = replace(
+                    evidence,
+                    queued=replace(evidence.queued, retired=True),
+                )
+                return
         for index, evidence in enumerate(self._pane_queue_operations):
             if evidence.turn is turn:
-                self._pane_queue_operations[index] = _QueuedPromptEvidence(
-                    evidence.content,
-                    evidence.turn,
+                self._pane_queue_operations[index] = replace(
+                    evidence,
                     retired=True,
                 )
                 return
@@ -8923,9 +10135,8 @@ class TmuxSession(TransportReplacementMixin):
                 and evidence.turn is None
                 and evidence.content == turn.prompt
             ):
-                self._pane_queue_operations[index] = _QueuedPromptEvidence(
-                    evidence.content,
-                    evidence.turn,
+                self._pane_queue_operations[index] = replace(
+                    evidence,
                     retired=True,
                 )
                 return
@@ -8976,6 +10187,34 @@ class TmuxSession(TransportReplacementMixin):
                     "positive evidence; suppressing unsafe replay"
                 )
         turn.transport_accepted = True
+        # #667: mirror the just-confirmed acceptance into the durable delivery
+        # ledger so a later re-entry of the same external message (across a
+        # restart that wipes this in-memory fence) is suppressed at the inbound
+        # entry point. Written strictly AFTER positive delivery evidence, so a
+        # recorded key always means a genuine prior delivery — the guard can
+        # only ever drop a true duplicate, never an undelivered message.
+        # Internal/wake/scheduler turns carry no message_id and are skipped.
+        if (
+            turn.message_id
+            and not turn.scheduler_serialized
+            and self._registry is not None
+        ):
+            try:
+                self._registry.mark_turn_delivered(
+                    self.agent_name,
+                    turn.platform,
+                    turn.chat_id,
+                    turn.message_id,
+                    source=turn.platform,
+                )
+            except Exception as exc:
+                # Durability is a safety net over the in-memory fence, never a
+                # correctness precondition for this turn — log loudly and let
+                # acceptance proceed rather than fail an accepted delivery.
+                _log(
+                    f"tmux[{self.agent_name}]: delivery-ledger mark failed "
+                    f"({type(exc).__name__}: {exc})"
+                )
         for receipt in (turn.scheduler_delivery, turn.submission_receipt):
             if receipt is not None and not receipt.done():
                 receipt.set_result(True)
@@ -8997,7 +10236,13 @@ class TmuxSession(TransportReplacementMixin):
         if self._wake_context_reload_guard is guard:
             self._wake_context_reload_guard = None
 
-    def _on_transcript_entry(self, entry: dict) -> None:
+    def _on_transcript_entry(
+        self,
+        entry: dict,
+        *,
+        entry_offset: int | None = None,
+        source_identity: tuple[int, int] | None = None,
+    ) -> None:
         """Consume transcript evidence strong enough for exact-turn receipts."""
         entry_type = entry.get("type")
         if entry_type == "queue-operation":
@@ -9009,12 +10254,28 @@ class TmuxSession(TransportReplacementMixin):
                     if isinstance(content, str)
                     else None
                 )
+                meta = self._inflight_meta_for_turn(turn)
                 if turn is not None:
                     turn.pane_queue_enqueued = True
                 self._pane_queue_operations.append(
                     _QueuedPromptEvidence(
-                        content if isinstance(content, str) else None,
-                        turn,
+                        content=(
+                            content if isinstance(content, str) else None
+                        ),
+                        turn=turn,
+                        occurrence_id=self._next_fold_occurrence_id(),
+                        entry_offset=entry_offset,
+                        source_identity=source_identity,
+                        ticket_offset=(
+                            meta.transcript_offset_at_paste
+                            if meta is not None
+                            else None
+                        ),
+                        ticket_identity=(
+                            meta.transcript_file_identity_at_paste
+                            if meta is not None
+                            else None
+                        ),
                     )
                 )
             elif operation == "dequeue" and self._pane_queue_operations:
@@ -9034,6 +10295,43 @@ class TmuxSession(TransportReplacementMixin):
                         queued_evidence.turn,
                         queued_evidence.retired,
                     )
+                )
+            elif operation == "remove":
+                content = entry.get("content")
+                if isinstance(content, str):
+                    matching_queue = next(
+                        (
+                            index
+                            for index, evidence in enumerate(
+                                self._pane_queue_operations
+                            )
+                            if evidence.content == content
+                        ),
+                        None,
+                    )
+                    if matching_queue is not None:
+                        queued_evidence = self._pane_queue_operations[
+                            matching_queue
+                        ]
+                        del self._pane_queue_operations[matching_queue]
+                        self._handle_fold_remove(
+                            queued_evidence,
+                            entry_offset=entry_offset,
+                            source_identity=source_identity,
+                        )
+            return
+
+        if entry_type == "attachment":
+            attachment = entry.get("attachment")
+            if (
+                isinstance(attachment, dict)
+                and attachment.get("type") == "queued_command"
+                and isinstance(attachment.get("prompt"), str)
+            ):
+                self._handle_fold_attachment(
+                    attachment["prompt"],
+                    entry_offset=entry_offset,
+                    source_identity=source_identity,
                 )
             return
 
@@ -9069,9 +10367,33 @@ class TmuxSession(TransportReplacementMixin):
                     if not evidence.accepted_at_dequeue and not evidence.retired:
                         self._mark_transport_accepted(evidence.turn)
                     return
-                self._mark_transport_accepted(
-                    self._match_acceptance_content(prompt)
-                )
+                turn = self._match_acceptance_content(prompt)
+                if turn is not None:
+                    self._mark_transport_accepted(turn)
+                else:
+                    for folded_turn in self._folded_acceptance_turns(prompt):
+                        folded_meta = next(
+                            (
+                                meta
+                                for meta in self._inflight_metas
+                                if meta.turn is folded_turn
+                            ),
+                            None,
+                        )
+                        if folded_meta is None:
+                            continue
+                        ticket_identity = (
+                            folded_meta.transcript_file_identity_at_paste
+                        )
+                        ticket_offset = folded_meta.transcript_offset_at_paste
+                        if not self._transcript_entry_matches_ticket(
+                            entry_offset=entry_offset,
+                            source_identity=source_identity,
+                            ticket_offset=ticket_offset,
+                            ticket_identity=ticket_identity,
+                        ):
+                            continue
+                        self._mark_transport_accepted(folded_turn)
 
     @staticmethod
     def _resolve_submission_receipt(
@@ -9081,6 +10403,20 @@ class TmuxSession(TransportReplacementMixin):
         receipt = turn.submission_receipt
         if receipt is not None and not receipt.done():
             receipt.set_result(accepted)
+
+    @staticmethod
+    def _receipt_state_label(receipt: asyncio.Future[bool] | None) -> str:
+        """Compact receipt state for anomalous-drop diagnostics."""
+        if receipt is None:
+            return "absent"
+        if not receipt.done():
+            return "pending"
+        if receipt.cancelled():
+            return "cancelled"
+        try:
+            return "accepted" if receipt.result() is True else "rejected"
+        except Exception:
+            return "error"
 
     @staticmethod
     def _receipt_accepted(receipt: asyncio.Future[bool]) -> bool:

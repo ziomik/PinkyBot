@@ -19,7 +19,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pinky_daemon.db_journal import configure_rollback_journal
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import (
+    StoreCatalog,
+    open_store_connection,
+    store_connection_policy,
+)
 
 
 def _fts5_phrase(query: str) -> str:
@@ -101,13 +105,21 @@ class ConversationStore:
         """Return the calling thread's connection, creating it on first use."""
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
-            connection = sqlite3.connect(self._db_path)
+            connection = open_store_connection(
+                self._catalog,
+                "conversations",
+                self._db_path,
+                owner=type(self).__name__,
+            )
             connection.row_factory = sqlite3.Row
             # #889: rollback (TRUNCATE) journal mode, NOT WAL — so an external
             # sqlite client opening this live DB and closing cannot unlink the
             # -wal/-shm out from under the daemon's connection. Sets busy_timeout
             # internally. See pinky_daemon.db_journal.
-            journal_mode = configure_rollback_journal(connection, busy_ms=30000)
+            journal_mode = configure_rollback_journal(
+                connection,
+                policy=store_connection_policy(self._catalog, "conversations"),
+            )
             if self._catalog is not None:
                 self._catalog.register(
                     "conversations",
@@ -395,6 +407,32 @@ class ConversationStore:
         )
         self._conn.commit()
         return cursor.rowcount
+
+    def edit_message(self, message_id: int, content: str) -> bool:
+        """Update the content of a message by its integer ID.  Returns True if updated."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ?",
+                (content, message_id),
+            )
+            return cur.rowcount > 0
+
+    def delete_message(self, message_id: int) -> bool:
+        """Delete a message by its integer ID.  Returns True if deleted."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM messages WHERE id = ?",
+                (message_id,),
+            )
+            return cur.rowcount > 0
+
+    def get_message(self, message_id: int) -> StoredMessage | None:
+        """Get a single message by its integer ID."""
+        row = self._conn.execute(
+            "SELECT * FROM messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+        return self._row_to_message(row) if row else None
 
     def close(self) -> None:
         """Close the calling thread's connection, if it has opened one.

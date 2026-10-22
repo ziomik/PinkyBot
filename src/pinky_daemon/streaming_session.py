@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pinky_daemon import resume_recovery
+from pinky_daemon import resume_recovery, skill_autoload
 from pinky_daemon.agent_registry import validate_restart_tokens_cap
 from pinky_daemon.api_readiness import (
     api_allows_submission,
@@ -874,6 +874,7 @@ class StreamingSession(TransportReplacementMixin):
                 "prompt_submitted",
                 metadata={"platform": platform, "chat_id": chat_id},
             )
+            agent_hint = skill_autoload.hint_for(self, prompt, agent_hint)  # #1288: skills by context
             await self._client.query(prompt + agent_hint)
             _log(f"streaming[{self.agent_name}]: sent message (chat={chat_id})")
             return True

@@ -25,7 +25,7 @@ import shlex
 import time
 from dataclasses import dataclass, field
 
-from pinky_daemon import codex_launch_env, resume_recovery
+from pinky_daemon import codex_launch_env, resume_recovery, skill_autoload
 from pinky_daemon.api_readiness import (
     api_allows_submission,
     defer_wake,
@@ -667,6 +667,7 @@ class CodexSession(TransportReplacementMixin):
             except Exception as e:
                 _log(f"codex[{self.agent_name}]: conversation store append failed: {e}")
 
+        agent_hint = skill_autoload.hint_for(self, prompt, agent_hint)  # #1288: skills by context
         queued_prompt = prompt + agent_hint if agent_hint else prompt
         if scheduler_delivery is None:
             queued = (queued_prompt, platform, chat_id, message_id)

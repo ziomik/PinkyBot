@@ -4138,6 +4138,10 @@ def create_api(
             ):
                 return
         agents.set_streaming_session_id(agent_name, resume_handle, label=label)
+        if not resume_handle:  # #1288: a new conversation, the active skills come back
+            from pinky_daemon import skill_autoload as _skill_autoload
+
+            _skill_autoload.on_context_restart(agent_name, label)
         short_id = resume_handle[:12] if resume_handle else ""
         _log(f"streaming[{agent_name}/{label}]: persisted resume_handle {short_id}")
         if not resume_handle and log_context_restart:
@@ -5227,6 +5231,12 @@ def create_api(
 
     skills = SkillStore(db_path=store_manifest["skills"].path, catalog=store_catalog)
     _seed_core_skills(skills)
+    # #1288: skills loaded by context (off unless PINKY_SKILL_AUTOLOAD=1 and the triggers file)
+    from pinky_daemon import skill_autoload as _skill_autoload
+
+    _skill_autoload.configure(
+        lambda agent: skills.get_agent_skills(agent, enabled_only=True), _data_dir
+    )
 
     # Discover SKILL.md files from filesystem and register them
     _pinky_root = Path(__file__).resolve().parent.parent.parent

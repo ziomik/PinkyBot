@@ -78,6 +78,7 @@ from typing import Literal
 from pinky_daemon import (
     isolated_launch_env,
     launch_env_authority,
+    skill_autoload,
     tmux_launch_env,
     tmux_launch_env_loader,
     tmux_server_env,
@@ -5511,6 +5512,7 @@ class TmuxSession(TransportReplacementMixin):
                     f"(user) raised: {e}"
                 )
 
+        agent_hint = skill_autoload.hint_for(self, prompt, agent_hint)  # #1288: skills by context
         queued_prompt = prompt + agent_hint if agent_hint else prompt
         turn = _QueuedTurn(
             prompt=queued_prompt,
